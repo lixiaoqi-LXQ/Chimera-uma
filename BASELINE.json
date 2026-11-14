@@ -1,0 +1,7 @@
+{
+  "source": "/home/lxq/graduate/ai-workspace/research/multivector/chimera-alg-ablation/source",
+  "upstream_commit": "f6c3a7925924283fc0bc4da64ce78f9cf129bca6",
+  "source_manifest_sha256": "6bfb61687d88d99d83dedf1baf8e5cd065073914e3e53d832baa153ed34bd337",
+  "baseline_binary_sha256": "c54539b5143f63ad96ab0118f165dded7861d9c5af180767cd74c66d7bd4945d",
+  "scope": "Imported experimental ARM baseline; Chimera+ modifies only full-bit scoring backend."
+}
