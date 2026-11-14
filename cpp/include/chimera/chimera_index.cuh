@@ -59,6 +59,8 @@ struct SearchOptions {
     int k_full_bit = 300;
     int cagra_itopk_size = 150;
     int num_chunks = 5;
+    bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
+    bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
 };
 
 inline void check_cuda(
@@ -217,6 +219,16 @@ class chimera_index {
         const float* queries_flat,
         const QueryState* queries,
         std::pair<float, int>* full_bit_scores);
+
+    void compute_cpu_full_bit_scores(
+        const int* refined_doc_ids, const int* candidate_indices, int count,
+        const float* queries_flat, const QueryState* queries,
+        std::pair<float, int>* scores);
+    void initialize_gpu_full_bit();
+    void release_gpu_full_bit() noexcept;
+    void compute_gpu_full_bit_scores(
+        const int* refined_doc_ids, const int* candidate_indices, int count,
+        const QueryState* queries, std::pair<float, int>* scores);
 
     bool profiling_enabled_ = false;
     bool capture_scores_ = false;

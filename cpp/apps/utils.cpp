@@ -168,6 +168,13 @@ SearchCliArgs parse_search_args(int argc, char** argv) {
         } else if (arg == "--cagra-itopk-size") {
             args.options.cagra_itopk_size =
                 std::stoi(require_value(argc, argv, i, arg));
+        } else if (arg == "--verify-full-bit") {
+            args.options.verify_full_bit = true;
+        } else if (arg == "--full-bit-device") {
+            const auto value = require_value(argc, argv, i, arg);
+            if (value != "cpu" && value != "gpu")
+                throw std::invalid_argument("--full-bit-device must be cpu or gpu");
+            args.options.gpu_full_bit = value == "gpu";
         } else if (arg == "--num-chunks") {
             args.options.num_chunks =
                 std::stoi(require_value(argc, argv, i, arg));
@@ -222,6 +229,7 @@ void print_build_help(const char* program) {
 
 void print_search_help(const char* program) {
     const SearchCliArgs defaults;
+    std::cout << "  --full-bit-device cpu|gpu  Full-bit scoring backend (Chimera+ default: gpu).\n";
     std::cout
         << "Usage: " << program << "\n"
         << "  --query <query_embeddings.bin>\n"

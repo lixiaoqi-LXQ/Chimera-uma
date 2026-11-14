@@ -5,6 +5,8 @@
 #include "rabitqlib/utils/space.hpp"
 #include "cpu_gemv_neon.hpp"
 #include <limits>
+#include <cstring>
+#include <iostream>
 namespace Chimera {
 void chimera_index::compute_full_bit_scores(
     const int* refined_doc_ids,
@@ -14,6 +16,31 @@ void chimera_index::compute_full_bit_scores(
     const QueryState* queries,
     std::pair<float, int>* full_bit_scores
 ) {
+    if (options_.gpu_full_bit) {
+        compute_gpu_full_bit_scores(refined_doc_ids, full_bit_candidate_indices,
+                                    num_full_bit_candidates, queries, full_bit_scores);
+        if (options_.verify_full_bit) {
+            std::vector<std::pair<float, int>> reference(num_full_bit_candidates);
+            compute_cpu_full_bit_scores(refined_doc_ids, full_bit_candidate_indices,
+                num_full_bit_candidates, queries_flat, queries, reference.data());
+            for (int i = 0; i < num_full_bit_candidates; ++i) {
+                if (reference[i].second != full_bit_scores[i].second ||
+                    std::memcmp(&reference[i].first, &full_bit_scores[i].first, sizeof(float)))
+                    throw std::runtime_error("GPU full-bit score differs from CPU at candidate " + std::to_string(i));
+            }
+            std::cout << "[FULLBIT_VERIFY] candidates=" << num_full_bit_candidates
+                      << " scores_fp32_bitwise=passed\n";
+        }
+        return;
+    }
+    compute_cpu_full_bit_scores(refined_doc_ids, full_bit_candidate_indices,
+        num_full_bit_candidates, queries_flat, queries, full_bit_scores);
+}
+
+void chimera_index::compute_cpu_full_bit_scores(
+    const int* refined_doc_ids, const int* full_bit_candidate_indices,
+    int num_full_bit_candidates, const float* queries_flat,
+    const QueryState* queries, std::pair<float, int>* full_bit_scores) {
     ProfileRange range(profiling_enabled_, "Chimera/cpu_fullbit", num_full_bit_candidates);
     const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
     const char* full_bit_codes = full_bit_codes_data();

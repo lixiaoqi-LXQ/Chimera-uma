@@ -13,6 +13,16 @@ namespace Chimera {
 
 struct chimera_index::Workspace {
     std::unique_ptr<FlatL2Router> flat_router;
+    const char* gpu_full_codes = nullptr;
+    const float* gpu_full_factors = nullptr;
+    void* registered_full_codes = nullptr;
+    void* registered_full_factors = nullptr;
+    int* d_full_doc_ids = nullptr;
+    float* d_full_cbex = nullptr;
+    float* d_full_scores = nullptr;
+    int* h_full_doc_ids = nullptr;
+    float* h_full_cbex = nullptr;
+    float* h_full_scores = nullptr;
     float* d_queries = nullptr;
     float* d_cb1_sumq = nullptr;
     int* d_refined_doc_lengths = nullptr;

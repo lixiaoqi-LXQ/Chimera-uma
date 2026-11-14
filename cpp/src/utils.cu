@@ -467,6 +467,7 @@ void chimera_index::allocate_workspace() {
     ws_->full_bit_candidate_indices.resize(ws_->max_full_bit_candidates);
     ws_->full_bit_scores.resize(ws_->max_full_bit_candidates);
     ws_->seen_doc_map.resize(num_docs, false);
+    if (options_.gpu_full_bit) initialize_gpu_full_bit();
 }
 
 void chimera_index::set_doc_mapping(const std::vector<int>& doc_lens) {
@@ -510,6 +511,7 @@ void chimera_index::release_resources() noexcept {
     (void)cudaFree(d_token_to_cluster_pos_);
 
     if (ws_ != nullptr) {
+        release_gpu_full_bit();
         (void)cudaFree(ws_->d_queries);
         (void)cudaFree(ws_->d_cb1_sumq);
         (void)cudaFree(ws_->d_lut);

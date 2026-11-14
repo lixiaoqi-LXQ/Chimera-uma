@@ -61,6 +61,7 @@ add_library(chimera_core STATIC
     cpp/src/kernels.cu
     cpp/src/quantization.cpp
     cpp/src/cpu_scoring.cpp
+    cpp/src/gpu_fullbit_scoring.cu
     cpp/src/flat_l2_router.cu
     cpp/src/search_impl.cu
     cpp/src/utils.cu
@@ -112,6 +113,9 @@ if(CHIMERA_BUILD_PYTHON)
     set_target_properties(chimera PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
+# Historical experiment-only targets are optional in an independent checkout.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../qa_flat.cpp" AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../qa_pipeline.cpp")
 # Isolated correctness executables; compilation never starts CUDA work.
 add_executable(algorithm_flat_qualification ../qa_flat.cpp)
 target_link_libraries(algorithm_flat_qualification PRIVATE chimera_core)
@@ -120,3 +124,9 @@ add_executable(algorithm_pipeline_qualification ../qa_pipeline.cpp)
 target_include_directories(algorithm_pipeline_qualification PRIVATE cpp/src)
 target_link_libraries(algorithm_pipeline_qualification PRIVATE chimera_core)
 set_target_properties(algorithm_pipeline_qualification PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
+add_executable(fullbit_gpu_qualification tests/fullbit_gpu.cpp)
+target_include_directories(fullbit_gpu_qualification PRIVATE cpp/src)
+target_link_libraries(fullbit_gpu_qualification PRIVATE chimera_core)
+set_target_properties(fullbit_gpu_qualification PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
