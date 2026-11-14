@@ -75,4 +75,5 @@ retaining initial result checks. `--profile-range` enables NVTX and brackets
 each measured round with CUDA profiler start/stop; use one round when capturing
 with `nsys --capture-range=cudaProfilerApi --capture-range-end=stop`.
 Profiler measurements are diagnostic; throughput results use ordinary runs.
-The report's batch chapter includes B1–B64 curves and the plateau analysis.
+The independent batch report at `reports/chimera-batch-search.md` includes
+B1–B64 curves and the plateau analysis.
