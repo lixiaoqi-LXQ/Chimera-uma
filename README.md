@@ -12,7 +12,7 @@ The current GPU scorer supports the experiment's 4bit, D128, 32-query-token repr
 
 Build outside the source tree with CUDA architecture 121, the existing cuVS/RMM toolchain and `CHIMERA_BUILD_PYTHON=OFF`. Targets: `gpu_search`, `fullbit_gpu_qualification`. The qualification compares actual CPU SIMD scoring with GPU output on nibble boundaries, reordered/repeated IDs, document lengths 1–300, negative scores, zero/tied scores and empty candidate batches.
 
-Heavy builds and all GPU validation/performance measurements use an exclusive nonblocking `~/device.lock`, held until all associated work completes. Build directories, logs, test specifications and outputs live in `/home/lxq/graduate/ai-workspace/`; they are not source artifacts.
+Heavy builds and all GPU validation/performance measurements use an exclusive nonblocking `~/device.lock`, held until all associated work completes. Build directories, logs, test specifications and outputs live in `/home/lxq/multi-query/ai-workspace/`; they are not source artifacts.
 
 The four frozen LoTTE configurations (CPU20, chunks1) remain:
 
@@ -23,4 +23,4 @@ The four frozen LoTTE configurations (CPU20, chunks1) remain:
 | 100 | .90 | 64 | 3000 | 300 | 96 |
 | 100 | .95 | 256 | 3000 | 300 | 288 |
 
-The single experiment report remains `/home/lxq/graduate/ai-workspace/research/multivector/report/lotte-r10-brief.md`.
+The single experiment report remains `/home/lxq/multi-query/reports/lotte-r10-brief.md`.
