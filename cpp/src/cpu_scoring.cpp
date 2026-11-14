@@ -44,7 +44,8 @@ void chimera_index::compute_cpu_full_bit_scores(
     ProfileRange range(profiling_enabled_, "Chimera/cpu_fullbit", num_full_bit_candidates);
     const size_t full_bit_codes_stride = PADDED_DIM * (1 + ex_bits) / 8;
     const char* full_bit_codes = full_bit_codes_data();
-    const auto& full_bit_factors = full_bit_factors_;
+    const auto& full_bit_factors = corpus().full_bit_factors_;
+    const auto& doc_ptrs = corpus().doc_ptrs_;
     alignas(64) float cbex_sumq_arr[Q_DOCLEN];
     for (size_t j = 0; j < Q_DOCLEN; j++)
         cbex_sumq_arr[j] = queries[j].cbex_sumq;
@@ -52,8 +53,8 @@ void chimera_index::compute_cpu_full_bit_scores(
 #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < num_full_bit_candidates; ++i) {
         int doc_id = refined_doc_ids[full_bit_candidate_indices[i]];
-        size_t doc_start = doc_ptrs_[doc_id];
-        size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+        size_t doc_start = doc_ptrs[doc_id];
+        size_t n_tok = doc_ptrs[doc_id + 1] - doc_start;
 
         alignas(64) float decoded[PADDED_DIM];
         alignas(64) float full_ip[Q_DOCLEN];

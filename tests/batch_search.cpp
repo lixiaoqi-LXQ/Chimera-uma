@@ -1,0 +1,229 @@
+#include "chimera/chimera_index.cuh"
+#include "chimera/config.cuh"
+#include "chimera/io.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <cstdio>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <regex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using Clock = std::chrono::steady_clock;
+using Ids = std::vector<std::vector<size_t>>;
+static double elapsed(Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now()-t).count();
+}
+static std::vector<float> read_queries(const std::string& path, size_t& count, size_t& len, size_t& dim) {
+    if (path.size() < 4 || path.substr(path.size()-4) != ".npy")
+        return Chimera::load_query(len, count, dim, path);
+    std::ifstream f(path, std::ios::binary);
+    char magic[6]; f.read(magic, 6);
+    if (std::memcmp(magic,"\x93NUMPY",6)) throw std::runtime_error("Invalid NPY magic");
+    unsigned char version[2]; f.read(reinterpret_cast<char*>(version),2);
+    uint32_t n = 0;
+    if (version[0] == 1) { uint16_t x=0; f.read(reinterpret_cast<char*>(&x),2); n=x; }
+    else if (version[0] == 2 || version[0] == 3) f.read(reinterpret_cast<char*>(&n),4);
+    else throw std::runtime_error("Unsupported NPY version");
+    std::string header(n,' '); f.read(header.data(),n);
+    if (header.find("'<f4'")==std::string::npos && header.find("'=f4'")==std::string::npos)
+        throw std::runtime_error("Queries require little-endian FP32 NPY");
+    if (header.find("'fortran_order': False")==std::string::npos)
+        throw std::runtime_error("Queries require C-order NPY");
+    std::smatch m;
+    if (!std::regex_search(header,m,std::regex("'shape': \\(([0-9]+), ([0-9]+), ([0-9]+),?\\)")))
+        throw std::runtime_error("Queries require shape [N,32,D]");
+    count=std::stoull(m[1]); len=std::stoull(m[2]); dim=std::stoull(m[3]);
+    if (!count || len!=32 || dim!=128) throw std::runtime_error("Expected nonempty [N,32,128] queries");
+    std::vector<float> values(count*len*dim);
+    f.read(reinterpret_cast<char*>(values.data()),values.size()*sizeof(float));
+    if (!f) throw std::runtime_error("Truncated query file");
+    return values;
+}
+static void write_ids(std::ostream& out, const Ids& rows) {
+    out << '[';
+    for(size_t i=0;i<rows.size();++i) {
+        if(i) out << ','; out << '[';
+        for(size_t j=0;j<rows[i].size();++j) { if(j)out << ','; out << rows[i][j]; }
+        out << ']';
+    }
+    out << ']';
+}
+static void require_rows(const Ids& rows, size_t count, size_t k) {
+    if(rows.size()!=count)throw std::runtime_error("Incomplete query count");
+    for(const auto& row:rows)if(row.size()!=k)throw std::runtime_error("Incomplete Top-k result");
+}
+int main(int argc,char** argv) try {
+    std::string index_path, query_path, output_path, worker_list="1,2,4,8";
+    size_t batch=32, rounds=3, limit=0, k=10;
+    Chimera::SearchOptions options;
+    options.nprobe=32; options.k_refine=1000; options.k_full_bit=20;
+    options.cagra_itopk_size=64; options.num_chunks=1;
+    for(int i=1;i<argc;++i) {
+        std::string arg=argv[i];
+        if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;continue; }
+        if(arg=="--help") {
+            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8 --batch-size 32 --rounds 3 --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit]\n";
+            return 0;
+        }
+        if(++i>=argc)throw std::invalid_argument("Missing value for "+arg);
+        std::string value=argv[i];
+        if(arg=="--index")index_path=value;
+        else if(arg=="--queries")query_path=value;
+        else if(arg=="--output")output_path=value;
+        else if(arg=="--workers")worker_list=value;
+        else if(arg=="--batch-size")batch=std::stoull(value);
+        else if(arg=="--rounds")rounds=std::stoull(value);
+        else if(arg=="--limit")limit=std::stoull(value);
+        else if(arg=="--topk")k=std::stoull(value);
+        else if(arg=="--nprobe")options.nprobe=std::stoi(value);
+        else if(arg=="--k-refine")options.k_refine=std::stoi(value);
+        else if(arg=="--k-full-bit")options.k_full_bit=std::stoi(value);
+        else if(arg=="--itopk")options.cagra_itopk_size=std::stoi(value);
+        else throw std::invalid_argument("Unknown option "+arg);
+    }
+    if(index_path.empty()||query_path.empty()||output_path.empty()||!batch||!rounds||!k)
+        throw std::invalid_argument("Require index, queries, output, positive batch/rounds/topk");
+    std::vector<size_t> workers;
+    std::istringstream input(worker_list); std::string part;
+    while(std::getline(input,part,',')) {
+        size_t w=std::stoull(part);
+        if(!w || w>batch)throw std::invalid_argument("Workers must be between 1 and batch-size");
+        workers.push_back(w);
+    }
+    if(workers.empty())throw std::invalid_argument("Empty workers list");
+    size_t n=0,len=0,dim=0;
+    auto queries=read_queries(query_path,n,len,dim);
+    if(len!=Q_DOCLEN || dim!=128)throw std::invalid_argument("Expected Q32 D128 queries");
+    if(limit)n=std::min(n,limit);
+    const size_t stride=len*dim, check_n=std::min(n,size_t(32));
+    Chimera::chimera_index index;
+    Chimera::LoadOptions load; load.low_memory=true;
+    index.load(index_path,options,load);
+    index.set_capture_scores(true);
+    Ids reference(check_n); std::vector<std::vector<float>> ref_scores(check_n);
+    for(size_t q=0;q<check_n;++q) {
+        reference[q]=index.search(queries.data()+q*stride,stride,k);
+        ref_scores[q]=index.last_result_scores();
+    }
+    require_rows(reference,check_n,k);
+    // A completed output file is the run receipt; interrupted work retains .partial.
+    const std::string partial_path=output_path+".partial";
+    std::ofstream out(partial_path);
+    if(!out)throw std::runtime_error("Cannot open output");
+    out << std::setprecision(12) << "{\"queries\":" << n << ",\"query_length\":"<<len
+        <<",\"dimension\":"<<dim<<",\"topk\":"<<k<<",\"batch_size\":"<<batch
+        <<",\"rounds\":"<<rounds<<",\"nprobe\":"<<options.nprobe
+        <<",\"k_refine\":"<<options.k_refine<<",\"k_full_bit\":"<<options.k_full_bit
+        <<",\"cagra_itopk_size\":"<<options.cagra_itopk_size<<",\"chunks\":1"
+        <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
+        <<",\"preflight_queries_per_point\":"<<n
+        <<",\"warmup_queries_per_round\":"<<std::min(n,std::max(size_t(32),batch))
+        <<",\"timing\":\"host FP32 queries to completed host IDs; QPS from whole query-loop wall time; no encoding/load/warmup/output/recall\""
+        <<",\"latency_unit\":\"batch completion ms, B1 per-query ms\",\"points\":[";
+    bool first_point=true;
+    // workers=0 denotes the original single-query API reference.
+    std::vector<size_t> modes{0}; modes.insert(modes.end(),workers.begin(),workers.end());
+    for(size_t w:modes) {
+        const auto point_start=Clock::now();
+        size_t bad_ids=0,bad_scores=0;
+        if(w) {
+            index.prepare_batch(w);
+            index.set_capture_scores(true);
+            for(size_t base=0;base<check_n;base+=batch) {
+                size_t count=std::min(batch,check_n-base);
+                auto actual=index.search_batch(queries.data()+base*stride,count*stride,k,w);
+                const auto& scores=index.last_batch_result_scores();
+                require_rows(actual,count,k);
+                if(scores.size()!=count)throw std::runtime_error("Missing batch scores");
+                for(size_t q=0;q<count;++q) {
+                    if(actual[q]!=reference[base+q])++bad_ids;
+                    if(scores[q].size()!=ref_scores[base+q].size() ||
+                       std::memcmp(scores[q].data(),ref_scores[base+q].data(),scores[q].size()*sizeof(float)))++bad_scores;
+                }
+            }
+        }
+        std::cout << "[CHECK] mode="<<(w?"batch":"B1")<<" workers="<<w<<" checked_queries="<<check_n
+                  <<" id_mismatch_queries="<<bad_ids<<" score_mismatch_queries="<<bad_scores<<std::endl;
+        if(!w) {
+            index.set_capture_scores(true);
+            for(size_t q=0;q<check_n;++q) {
+                auto actual=index.search(queries.data()+q*stride,stride,k);
+                const auto& scores=index.last_result_scores();
+                if(actual!=reference[q])++bad_ids;
+                if(scores.size()!=ref_scores[q].size() ||
+                   std::memcmp(scores.data(),ref_scores[q].data(),scores.size()*sizeof(float)))++bad_scores;
+            }
+            std::cout << "[B1_REPEAT] id_mismatch_queries="<<bad_ids
+                      <<" score_mismatch_queries="<<bad_scores<<std::endl;
+        }
+        index.set_capture_scores(false);
+        // Exercise the full fixed workload once on every lane before timing.
+        // This grows candidate arenas and initializes CUDA per-thread state;
+        // startup allocation/synchronization must not masquerade as throughput.
+        for(size_t base=0;base<n;base+=(w?batch:1)) {
+            if(w) index.search_batch(queries.data()+base*stride,
+                std::min(batch,n-base)*stride,k,w);
+            else index.search(queries.data()+base*stride,stride,k);
+        }
+        Chimera::check_cuda(cudaDeviceSynchronize());
+        if(!first_point)out<<','; first_point=false;
+        out << "{\"mode\":\""<<(w?"batch":"B1")<<"\",\"workers\":"<<w
+            <<",\"checked_queries\":"<<check_n<<",\"id_mismatch_queries\":"<<bad_ids
+            <<",\"score_mismatch_queries\":"<<bad_scores<<",\"measurements\":[";
+        for(size_t round=0;round<rounds;++round) {
+            const size_t warm_n=std::min(n,std::max(size_t(32),batch));
+            for(size_t base=0;base<warm_n;base+=(w?batch:1)) {
+                size_t count=std::min(batch,warm_n-base);
+                if(w)index.search_batch(queries.data()+base*stride,count*stride,k,w);
+                else index.search(queries.data()+base*stride,stride,k);
+            }
+            Chimera::check_cuda(cudaDeviceSynchronize());
+            std::vector<double> latencies;
+            Ids results(n);
+            const auto loop_start=Clock::now();
+            for(size_t base=0;base<n;base+=(w?batch:1)) {
+                const auto call_start=Clock::now();
+                if(w) {
+                    const size_t count=std::min(batch,n-base);
+                    auto rows=index.search_batch(queries.data()+base*stride,count*stride,k,w);
+                    latencies.push_back(elapsed(call_start));
+                    for(size_t q=0;q<count;++q)results[base+q]=std::move(rows[q]);
+                } else {
+                    results[base]=index.search(queries.data()+base*stride,stride,k);
+                    latencies.push_back(elapsed(call_start));
+                }
+            }
+            Chimera::check_cuda(cudaDeviceSynchronize());
+            const double wall_ms=elapsed(loop_start);
+            require_rows(results,n,k);
+            const double search_ms=std::accumulate(latencies.begin(),latencies.end(),0.0);
+            std::sort(latencies.begin(),latencies.end());
+            const double p99=latencies[std::min(latencies.size()-1,size_t(std::ceil(latencies.size()*0.99)-1))];
+            if(round)out<<',';
+            out << "{\"round\":"<<round+1<<",\"completed_queries\":"<<n<<",\"loop_wall_ms\":"<<wall_ms
+                <<",\"search_ms\":"<<search_ms<<",\"qps\":"<<n*1000.0/wall_ms
+                <<",\"batch_latency_mean_ms\":"<<search_ms/latencies.size()<<",\"batch_latency_p99_ms\":"<<p99
+                <<",\"result_ids\":";
+            write_ids(out,results); out << '}'; out.flush();
+            std::cout << "[RESULT] mode="<<(w?"batch":"B1")<<" workers="<<w<<" round="<<round+1
+                      <<" completed="<<n<<" qps="<<n*1000.0/wall_ms<<" batch_mean_ms="<<search_ms/latencies.size()
+                      <<" batch_p99_ms="<<p99<<std::endl;
+        }
+        out << "],\"point_wall_ms\":"<<elapsed(point_start)<<'}'; out.flush();
+    }
+    out << "],\"completed\":true}\n";
+    out.close();
+    if(!out)throw std::runtime_error("Failed writing output");
+    if(std::rename(partial_path.c_str(),output_path.c_str()))throw std::runtime_error("Cannot finalize output");
+    return 0;
+} catch(const std::exception& e) {
+    std::cerr<<"[FAILED] "<<e.what()<<std::endl; return 1;
+}

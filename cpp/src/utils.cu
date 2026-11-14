@@ -320,7 +320,8 @@ void chimera_index::allocate_workspace() {
         max_candidate_docs_per_query_ * Q_DOCLEN);
     ws_->max_refined_candidates = skips_candidate_refinement(options_.algorithm_variant)
         ? max_candidate_docs_ : size_t(options_.k_refine);
-    ws_->max_refined_tokens = compute_refined_token_bound(doc_ptrs_, ws_->max_refined_candidates);
+    ws_->max_refined_tokens = (batch_owner_ ? batch_owner_->ws_->max_refined_tokens :
+        compute_refined_token_bound(doc_ptrs_, ws_->max_refined_candidates));
     candidate_bitmap_bucket_count_ = candidate_bitmap_num_buckets(num_docs);
     candidate_bitmap_offset_count_ =
         candidate_bitmap_num_offsets(candidate_bitmap_bucket_count_);
@@ -457,9 +458,9 @@ void chimera_index::allocate_workspace() {
 
     int least_prio, greatest_prio;
     check_cuda(cudaDeviceGetStreamPriorityRange(&least_prio, &greatest_prio));
-    check_cuda(cudaStreamCreateWithPriority(&ws_->stream_compute, cudaStreamDefault, least_prio));
-    check_cuda(cudaStreamCreate(&ws_->stream_h2d));
-    check_cuda(cudaStreamCreate(&ws_->stream_d2h));
+    check_cuda(cudaStreamCreateWithPriority(&ws_->stream_compute, cudaStreamNonBlocking, least_prio));
+    check_cuda(cudaStreamCreateWithFlags(&ws_->stream_h2d, cudaStreamNonBlocking));
+    check_cuda(cudaStreamCreateWithFlags(&ws_->stream_d2h, cudaStreamNonBlocking));
     check_cuda(cudaEventCreate(&ws_->event_h2d_done));
 
 
@@ -494,21 +495,28 @@ void chimera_index::release_resources() noexcept {
         (void)cudaDeviceSynchronize();
     }
 
+    // Internal batch workers must finish and release their private workspaces
+    // before any shared corpus pointer or host registration is released.
+    batch_workers_.clear();
+    last_batch_result_scores_.clear();
+
     // Release exact-flat asynchronous users before their borrowed centroid storage.
     if (ws_) ws_->flat_router.reset();
-    delete ivf;
+    if (!batch_owner_) delete ivf;
     ivf = nullptr;
     cagra_res_.reset();
 
     (void)cudaFree(d_candidate_bitmap_);
     (void)cudaFree(d_candidate_bitmap_offsets_);
     (void)cudaFree(d_candidate_arena_raw_);
+    if (!batch_owner_) {
     (void)cudaFree(d_doc_ptrs_);
     (void)cudaFree(d_cluster_pos_);
     (void)cudaFree(d_clustered_one_bit_codes_);
     (void)cudaFree(d_clustered_one_bit_factors_);
     (void)cudaFree(d_clustered_doc_ids_);
     (void)cudaFree(d_token_to_cluster_pos_);
+    }
 
     if (ws_ != nullptr) {
         release_gpu_full_bit();
@@ -536,7 +544,7 @@ void chimera_index::release_resources() noexcept {
     }
     ws_.reset();
 
-    delete rotator_;
+    if (!batch_owner_) delete rotator_;
     rotator_ = nullptr;
 
     d_candidate_bitmap_ = nullptr;
@@ -569,6 +577,7 @@ void chimera_index::release_resources() noexcept {
     ex_bits = 0;
     num_docs = 0;
     max_cluster_size = 0;
+    batch_owner_ = nullptr;
     has_index_ = false;
     search_ready_ = false;
 }
@@ -577,6 +586,7 @@ void chimera_index::release_resources() noexcept {
 
 namespace Chimera {
 const char* chimera_index::full_bit_codes_data() const {
+    if (batch_owner_) return batch_owner_->full_bit_codes_data();
     if (spilled_full_bit_codes_) return spilled_full_bit_codes_->data();
     return mapped_full_bit_data_ ? mapped_full_bit_data_ : full_bit_codes_.data();
 }

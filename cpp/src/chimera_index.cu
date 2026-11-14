@@ -16,6 +16,8 @@
 #include <raft/core/resources.hpp>
 
 #include <filesystem>
+#include <omp.h>
+#include <exception>
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -332,4 +334,98 @@ void chimera_index::initialize_search_state() {
     search_ready_ = true;
 }
 
+}  // namespace Chimera
+
+namespace Chimera {
+
+void chimera_index::prepare_batch(size_t workers) {
+    if (!has_index_ || batch_owner_)
+        throw std::runtime_error("Batch search requires a loaded owner index");
+    if (workers == 0 || workers > 20)
+        throw std::invalid_argument("Batch workers must be in [1, 20]");
+    if (options_.algorithm_variant != AlgorithmVariant::Full)
+        throw std::invalid_argument("Multi-stream batch currently supports the full algorithm");
+    if (!search_ready_) initialize_search_state();
+    // Worker zero is the owner itself, preserving the existing B1 path.
+    while (batch_workers_.size() + 1 < workers) {
+        auto worker = std::make_unique<chimera_index>();
+        worker->batch_owner_ = this;
+        worker->options_ = options_;
+        worker->n = n;
+        worker->d = d;
+        worker->n_clusters = n_clusters;
+        worker->ex_bits = ex_bits;
+        worker->num_docs = num_docs;
+        worker->max_cluster_size = max_cluster_size;
+        worker->max_probed_clusters_ = max_probed_clusters_;
+        worker->max_retrieved_tokens_per_query_ = max_retrieved_tokens_per_query_;
+        worker->max_candidate_docs_per_query_ = max_candidate_docs_per_query_;
+        worker->unpack_func_ = unpack_func_;
+        worker->rotator_ = rotator_;
+        worker->ivf = ivf;
+        worker->d_doc_ptrs_ = d_doc_ptrs_;
+        worker->d_cluster_pos_ = d_cluster_pos_;
+        worker->d_clustered_one_bit_codes_ = d_clustered_one_bit_codes_;
+        worker->d_clustered_one_bit_factors_ = d_clustered_one_bit_factors_;
+        worker->d_clustered_doc_ids_ = d_clustered_doc_ids_;
+        worker->d_token_to_cluster_pos_ = d_token_to_cluster_pos_;
+        worker->cagra_res_ = std::make_unique<raft::resources>();
+        worker->ws_ = std::make_unique<Workspace>();
+        worker->has_index_ = true;
+        worker->allocate_workspace();
+        worker->search_ready_ = true;
+        batch_workers_.push_back(std::move(worker));
+    }
+}
+
+std::vector<std::vector<size_t>> chimera_index::search_batch(
+    const float* queries, size_t query_values, size_t k, size_t workers) {
+    if (!has_index_ || !d)
+        throw std::runtime_error("Cannot search an empty Chimera index");
+    const size_t stride = Q_DOCLEN * d;
+    if (query_values % stride || (query_values && !queries) || !k)
+        throw std::invalid_argument("Batch queries must have shape [B, 32, d] and k > 0");
+    if (!workers || workers > 20)
+        throw std::invalid_argument("Batch workers must be in [1, 20]");
+    const size_t count = query_values / stride;
+    last_batch_result_scores_.clear();
+    if (!count) return {};
+    workers = std::min(workers, count);
+    prepare_batch(workers);
+    std::vector<std::vector<size_t>> results(count);
+    if (capture_scores_) last_batch_result_scores_.resize(count);
+    const bool capture = capture_scores_;
+    const bool profile = profiling_enabled_;
+    std::vector<std::exception_ptr> errors(workers);
+    int device = 0;
+    check_cuda(cudaGetDevice(&device));
+    // One host submitter per lane allows the existing stream synchronizations
+    // to wait independently. OpenMP reuses its thread team between batches.
+    // Each loop iteration owns its lane even when OMP_DYNAMIC reduces the team.
+#pragma omp parallel for num_threads(workers) schedule(static, 1)
+    for (int lane = 0; lane < static_cast<int>(workers); ++lane) {
+        auto& worker = lane == 0 ? *this : *batch_workers_[lane - 1];
+        worker.capture_scores_ = capture;
+        worker.profiling_enabled_ = profile;
+        try {
+            check_cuda(cudaSetDevice(device));
+            for (size_t q = lane; q < count; q += workers) {
+                results[q] = worker.search_one(queries + q * stride, k);
+                if (capture) last_batch_result_scores_[q] = worker.last_result_scores_;
+            }
+        } catch (...) {
+            errors[lane] = std::current_exception();
+        }
+    }
+    for (const auto& error : errors) {
+        if (error) {
+            // Drain all GPU users before propagating a failure. Invalidate the
+            // index rather than reuse partially modified candidate/seen state.
+            (void)cudaDeviceSynchronize();
+            release_resources();
+            std::rethrow_exception(error);
+        }
+    }
+    return results;
+}
 }  // namespace Chimera

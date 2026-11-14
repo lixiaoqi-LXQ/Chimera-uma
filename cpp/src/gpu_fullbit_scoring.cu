@@ -79,16 +79,22 @@ void launch_full_bit_gpu(const char* codes, const float* factors,
 void chimera_index::initialize_gpu_full_bit() {
     if (ex_bits != 3 || PADDED_DIM != 128 || Q_DOCLEN != 32)
         throw std::runtime_error("Chimera+ GPU full-bit scorer requires 4bit, D128, Q32");
+    bool ats = false;
+    if (batch_owner_) {
+        ws_->gpu_full_codes = batch_owner_->ws_->gpu_full_codes;
+        ws_->gpu_full_factors = batch_owner_->ws_->gpu_full_factors;
+    } else {
     int device = 0, pageable = 0, host_tables = 0;
     check_cuda(cudaGetDevice(&device));
     check_cuda(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device));
     check_cuda(cudaDeviceGetAttribute(&host_tables,
                cudaDevAttrPageableMemoryAccessUsesHostPageTables, device));
-    const bool ats = pageable && host_tables;
+    ats = pageable && host_tables;
     ws_->gpu_full_codes = gpu_visible(full_bit_codes_data(), n * 64, ats, low_memory_load_,
                                       ws_->registered_full_codes);
     ws_->gpu_full_factors = gpu_visible(full_bit_factors_.data(), n * sizeof(float), ats, false,
                                         ws_->registered_full_factors);
+    }
     const size_t count = ws_->max_full_bit_candidates;
     check_cuda(cudaMalloc(&ws_->d_full_doc_ids, count * sizeof(int)));
     check_cuda(cudaMalloc(&ws_->d_full_cbex, 32 * sizeof(float)));
@@ -96,7 +102,7 @@ void chimera_index::initialize_gpu_full_bit() {
     check_cuda(cudaMallocHost(&ws_->h_full_doc_ids, count * sizeof(int)));
     check_cuda(cudaMallocHost(&ws_->h_full_cbex, 32 * sizeof(float)));
     check_cuda(cudaMallocHost(&ws_->h_full_scores, count * sizeof(float)));
-    std::cout << "[FULLBIT] backend=gpu access=" << (ats ? "ATS_host_page_tables" : "mapped_host")
+    std::cout << "[FULLBIT] backend=gpu access=" << (batch_owner_ ? "shared_owner" : (ats ? "ATS_host_page_tables" : "mapped_host"))
               << " precision=fp32 codes_bytes=" << n * 64 << " corpus_copy_bytes=0\n";
 }
 

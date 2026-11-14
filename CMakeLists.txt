@@ -130,3 +130,8 @@ add_executable(fullbit_gpu_qualification tests/fullbit_gpu.cpp)
 target_include_directories(fullbit_gpu_qualification PRIVATE cpp/src)
 target_link_libraries(fullbit_gpu_qualification PRIVATE chimera_core)
 set_target_properties(fullbit_gpu_qualification PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# Multi-stream throughput comparison against the unchanged single-query API.
+add_executable(batch_search_benchmark tests/batch_search.cpp)
+target_link_libraries(batch_search_benchmark PRIVATE chimera_core)
+set_target_properties(batch_search_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

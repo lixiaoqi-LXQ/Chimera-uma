@@ -146,6 +146,17 @@ class chimera_index {
         size_t query_size,
         size_t k);
 
+    // Synchronous multi-stream batch. Contiguous [B, 32, d] FP32 input;
+    // query_values counts floats. Results retain input order. A single index
+    // object must not be called concurrently (including load/save/search).
+    // Allocate reusable worker workspaces outside throughput timing.
+    void prepare_batch(size_t workers);
+    std::vector<std::vector<size_t>> search_batch(
+        const float* queries, size_t query_values, size_t k, size_t workers);
+    const std::vector<std::vector<float>>& last_batch_result_scores() const {
+        return last_batch_result_scores_;
+    }
+
     // Optional observation only; disabled for original API callers.
     void set_profiling_enabled(bool enabled) { profiling_enabled_ = enabled; }
     void set_capture_scores(bool enabled) { capture_scores_ = enabled; }
@@ -229,6 +240,13 @@ class chimera_index {
     void compute_gpu_full_bit_scores(
         const int* refined_doc_ids, const int* candidate_indices, int count,
         const QueryState* queries, std::pair<float, int>* scores);
+
+    // Internal workers borrow immutable corpus storage from this owner. They
+    // are destroyed before the owner frees that storage; no index is reloaded.
+    const chimera_index* batch_owner_ = nullptr;
+    std::vector<std::unique_ptr<chimera_index>> batch_workers_;
+    std::vector<std::vector<float>> last_batch_result_scores_;
+    const chimera_index& corpus() const { return batch_owner_ ? *batch_owner_ : *this; }
 
     bool profiling_enabled_ = false;
     bool capture_scores_ = false;
