@@ -16,6 +16,9 @@
 #include <raft/core/resources.hpp>
 
 #include <filesystem>
+#include <cstdlib>
+#include <cstring>
+#include <sys/mman.h>
 #include <omp.h>
 #include <exception>
 #include <chrono>
@@ -29,6 +32,18 @@
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    if (options.uma_cpu_refine && (!options.uma_cpu_candidates || !options.uma_query_buffers))
+        throw std::invalid_argument("UMA CPU refine requires CPU candidates and UMA query buffers");
+    if (options.uma_cpu_refine && skips_candidate_refinement(options.algorithm_variant))
+        throw std::invalid_argument("UMA CPU refine requires candidate refinement");
+    if (options.uma_cpu_candidates && !options.uma_query_buffers)
+        throw std::invalid_argument("UMA CPU candidates require uma_query_buffers");
+    const auto placement = static_cast<int>(options.cagra_memory_placement);
+    if (placement < 0 || placement > static_cast<int>(CagraMemoryPlacement::AtsDatasetAndGraph))
+        throw std::invalid_argument("Unknown CAGRA memory placement");
+    if (options.cagra_memory_placement != CagraMemoryPlacement::Device &&
+        uses_flat_centroid_route(options.algorithm_variant))
+        throw std::invalid_argument("CAGRA memory placement requires the CAGRA graph route");
     const auto variant = static_cast<int>(options.algorithm_variant);
     if (variant < static_cast<int>(AlgorithmVariant::Full) || variant > static_cast<int>(AlgorithmVariant::Neither))
         throw std::invalid_argument("Unknown algorithm ablation enum");
@@ -319,8 +334,34 @@ void chimera_index::initialize_search_state() {
         if (graph.metric() != cuvs::distance::DistanceType::L2Expanded)
             throw std::invalid_argument("Exact flat ablation requires the original default L2Expanded metric");
     }
+    if (options_.cagra_memory_placement != CagraMemoryPlacement::Device)
+        ivf->pg_index->place_in_ats_hugepages(
+            options_.cagra_memory_placement == CagraMemoryPlacement::AtsDatasetAndGraph);
     compute_candidate_bounds();
     allocate_workspace();
+    if (options_.uma_cpu_candidates) {
+        // Initialization only: replace the device allocation with one shared ATS
+        // allocation. RAII retains the old device owner if allocation/copy fails.
+        constexpr size_t page = size_t(2) << 20;
+        const size_t bytes = n * sizeof(int);
+        if (bytes > std::numeric_limits<size_t>::max() - (page - 1))
+            throw std::overflow_error("UMA corpus allocation size overflow");
+        const size_t rounded = (bytes + page - 1) & ~(page - 1);
+        void* raw = nullptr;
+        if (posix_memalign(&raw, page, std::max(page, rounded)) != 0)
+            throw std::bad_alloc();
+        std::unique_ptr<void, decltype(&std::free)> allocation(raw, &std::free);
+        if (madvise(raw, std::max(page, rounded), MADV_HUGEPAGE) != 0)
+            throw std::runtime_error("Cannot request huge pages for UMA candidate corpus");
+        std::memset(raw, 0, std::max(page, rounded));
+        check_cuda(cudaMemcpy(raw, d_clustered_doc_ids_, bytes, cudaMemcpyDeviceToHost));
+        check_cuda(cudaFree(d_clustered_doc_ids_));
+        h_uma_clustered_doc_ids_ = static_cast<int*>(allocation.release());
+        d_clustered_doc_ids_ = h_uma_clustered_doc_ids_;
+        std::cout << "[UMA_ALLOC] name=clustered_doc_ids ptr=" << raw
+                  << " requested_bytes=" << bytes << " allocated_bytes=" << std::max(page, rounded)
+                  << " alignment=" << page << std::endl;
+    }
     if (uses_flat_centroid_route(options_.algorithm_variant)) {
         const auto matrix = ivf->pg_index->index_cagra->dataset();
         ws_->flat_router = std::make_unique<FlatL2Router>(matrix.data_handle(), n_clusters, PADDED_DIM, matrix.stride(0), Q_DOCLEN);

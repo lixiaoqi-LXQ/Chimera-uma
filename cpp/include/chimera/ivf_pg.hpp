@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,11 +22,17 @@ struct PG_CAGRA {
     struct FreeDataset { void operator()(float* ptr) const noexcept { if (ptr) (void)cudaFree(ptr); } };
     // Declared before index_cagra so index is destroyed before its backing dataset.
     std::unique_ptr<float, FreeDataset> explicit_dataset_;
+    struct FreeAts { void operator()(void* ptr) const noexcept { std::free(ptr); } };
+    // Keep all backing owners before the non-owning CAGRA view.
+    std::unique_ptr<void, FreeAts> ats_dataset_;
+    std::unique_ptr<void, FreeAts> ats_graph_;
     std::unique_ptr<cuvs::neighbors::cagra::index<float, uint32_t>> index_cagra;
 
     PG_CAGRA(size_t n, size_t d);
 
     void build_index(const float* data);
+    // Initialization only; keeps data/graph bytes and search kernels unchanged.
+    void place_in_ats_hugepages(bool include_graph);
     void search_centroids(
         const float* d_queries,
         size_t n_queries,

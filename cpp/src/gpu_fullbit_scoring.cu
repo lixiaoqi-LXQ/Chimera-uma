@@ -3,8 +3,11 @@
 #include "chimera/config.cuh"
 #include "chimera/profiling.hpp"
 #include "chimera_index_internal.cuh"
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <math_constants.h>
+#include <new>
 #include <stdexcept>
 
 namespace Chimera {
@@ -65,6 +68,17 @@ const T* gpu_visible(const T* host, size_t bytes, bool ats, bool readonly, void*
     check_cuda(cudaHostGetDevicePointer(&device, registered, 0), "map full-bit storage");
     return static_cast<const T*>(device);
 }
+
+template<class T>
+void allocate_ats_metadata(T*& host, T*& device, size_t count) {
+    const size_t bytes = count * sizeof(T);
+    void* storage = nullptr;
+    if (::posix_memalign(&storage, 256, bytes) != 0) throw std::bad_alloc();
+    host = static_cast<T*>(storage);
+    device = host;
+    // Commit the ordinary CPU pages before the GPU first accesses them via ATS.
+    std::memset(host, 0, bytes);
+}
 }
 
 void launch_full_bit_gpu(const char* codes, const float* factors,
@@ -96,24 +110,38 @@ void chimera_index::initialize_gpu_full_bit() {
                                         ws_->registered_full_factors);
     }
     const size_t count = ws_->max_full_bit_candidates;
-    check_cuda(cudaMalloc(&ws_->d_full_doc_ids, count * sizeof(int)));
-    check_cuda(cudaMalloc(&ws_->d_full_cbex, 32 * sizeof(float)));
-    check_cuda(cudaMalloc(&ws_->d_full_scores, count * sizeof(float)));
-    check_cuda(cudaMallocHost(&ws_->h_full_doc_ids, count * sizeof(int)));
-    check_cuda(cudaMallocHost(&ws_->h_full_cbex, 32 * sizeof(float)));
-    check_cuda(cudaMallocHost(&ws_->h_full_scores, count * sizeof(float)));
+    if (ws_->uma_query_buffers) {
+        // The workspace owns each host allocation once. The corresponding d_
+        // pointer is an alias for direct GPU access, not a second allocation.
+        allocate_ats_metadata(ws_->h_full_doc_ids, ws_->d_full_doc_ids, count);
+        allocate_ats_metadata(ws_->h_full_cbex, ws_->d_full_cbex, size_t{32});
+        allocate_ats_metadata(ws_->h_full_scores, ws_->d_full_scores, count);
+    } else {
+        check_cuda(cudaMalloc(&ws_->d_full_doc_ids, count * sizeof(int)));
+        check_cuda(cudaMalloc(&ws_->d_full_cbex, 32 * sizeof(float)));
+        check_cuda(cudaMalloc(&ws_->d_full_scores, count * sizeof(float)));
+        check_cuda(cudaMallocHost(&ws_->h_full_doc_ids, count * sizeof(int)));
+        check_cuda(cudaMallocHost(&ws_->h_full_cbex, 32 * sizeof(float)));
+        check_cuda(cudaMallocHost(&ws_->h_full_scores, count * sizeof(float)));
+    }
     std::cout << "[FULLBIT] backend=gpu access=" << (batch_owner_ ? "shared_owner" : (ats ? "ATS_host_page_tables" : "mapped_host"))
               << " precision=fp32 codes_bytes=" << n * 64 << " corpus_copy_bytes=0\n";
 }
 
 void chimera_index::release_gpu_full_bit() noexcept {
     if (!ws_) return;
-    (void)cudaFree(ws_->d_full_doc_ids);
-    (void)cudaFree(ws_->d_full_cbex);
-    (void)cudaFree(ws_->d_full_scores);
-    (void)cudaFreeHost(ws_->h_full_doc_ids);
-    (void)cudaFreeHost(ws_->h_full_cbex);
-    (void)cudaFreeHost(ws_->h_full_scores);
+    if (ws_->uma_query_buffers) {
+        std::free(ws_->h_full_doc_ids);
+        std::free(ws_->h_full_cbex);
+        std::free(ws_->h_full_scores);
+    } else {
+        (void)cudaFree(ws_->d_full_doc_ids);
+        (void)cudaFree(ws_->d_full_cbex);
+        (void)cudaFree(ws_->d_full_scores);
+        (void)cudaFreeHost(ws_->h_full_doc_ids);
+        (void)cudaFreeHost(ws_->h_full_cbex);
+        (void)cudaFreeHost(ws_->h_full_scores);
+    }
     if (ws_->registered_full_codes) (void)cudaHostUnregister(ws_->registered_full_codes);
     if (ws_->registered_full_factors) (void)cudaHostUnregister(ws_->registered_full_factors);
 }
@@ -128,15 +156,21 @@ void chimera_index::compute_gpu_full_bit_scores(const int* refined_ids,
     for (int i = 0; i < count; ++i) ws_->h_full_doc_ids[i] = refined_ids[candidate_indices[i]];
     for (int j = 0; j < 32; ++j) ws_->h_full_cbex[j] = queries[j].cbex_sumq;
     auto stream = ws_->stream_compute;
-    check_cuda(cudaMemcpyAsync(ws_->d_full_doc_ids, ws_->h_full_doc_ids,
-        count * sizeof(int), cudaMemcpyHostToDevice, stream));
-    check_cuda(cudaMemcpyAsync(ws_->d_full_cbex, ws_->h_full_cbex,
-        32 * sizeof(float), cudaMemcpyHostToDevice, stream));
+    if (!ws_->uma_query_buffers) {
+        check_cuda(cudaMemcpyAsync(ws_->d_full_doc_ids, ws_->h_full_doc_ids,
+            count * sizeof(int), cudaMemcpyHostToDevice, stream));
+        check_cuda(cudaMemcpyAsync(ws_->d_full_cbex, ws_->h_full_cbex,
+            32 * sizeof(float), cudaMemcpyHostToDevice, stream));
+    }
     launch_full_bit_gpu(ws_->gpu_full_codes, ws_->gpu_full_factors,
         d_doc_ptrs_, ws_->d_full_doc_ids, ws_->d_queries, ws_->d_full_cbex,
         count, ws_->d_full_scores, stream);
-    check_cuda(cudaMemcpyAsync(ws_->h_full_scores, ws_->d_full_scores,
-        count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    if (!ws_->uma_query_buffers) {
+        check_cuda(cudaMemcpyAsync(ws_->h_full_scores, ws_->d_full_scores,
+            count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    }
+    // Also orders CPU reads of ATS score storage after GPU writes, and
+    // makes all metadata safe for reuse by the next full-bit scoring call.
     check_cuda(cudaStreamSynchronize(stream));
     for (int i = 0; i < count; ++i) scores[i] = {ws_->h_full_scores[i], ws_->h_full_doc_ids[i]};
 }

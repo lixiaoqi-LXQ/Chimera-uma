@@ -509,6 +509,68 @@ __global__ void one_bit_token_score_kernel(
 }
 
 
+// Same token/query mapping and FP32 accumulation order as the control.
+// Keep two packed words and eight query accumulators live, instead of 32
+// separately decoded nibble registers. Only the c loop is kept rolled.
+__global__ void one_bit_token_score_compact_kernel(
+    const float* __restrict__ d_lut,
+    const char* __restrict__ d_clustered_code,
+    const float* __restrict__ d_clustered_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_clustered_pos,
+    float* __restrict__ d_one_bit_scores,
+    size_t total_tokens,
+    size_t batch_tokens
+) {
+    static_assert(NUM_U64 == 2 && NUM_CHUNKS == 32 && DOCUMENT_SCORING_LUT_TILE_Q == 8,
+                  "Compact token scorer requires D128, Q-tile8");
+    extern __shared__ float smem[];
+    float* smem_lut = smem;
+    float* smem_cb1_sumq = smem + DOCUMENT_SCORING_LUT_SMEM_FLOATS;
+    const size_t tok_base = static_cast<size_t>(blockIdx.x) * blockDim.x;
+    for (size_t base = tok_base; base < batch_tokens;
+         base += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        const size_t tok = base + threadIdx.x;
+        const bool valid = tok < batch_tokens;
+        uint64_t code0 = 0, code1 = 0;
+        float factor = 0.0f;
+        if (valid) {
+            const uint32_t pos = d_clustered_pos[tok];
+            const uint64_t* codes = reinterpret_cast<const uint64_t*>(
+                d_clustered_code + static_cast<size_t>(pos) * CODE_BYTES);
+            code0 = codes[0]; code1 = codes[1];
+            factor = d_clustered_factor[pos];
+        }
+        #pragma unroll
+        for (int tile = 0; tile < DOCUMENT_SCORING_LUT_NUM_TILES; ++tile) {
+            const int q_start = tile * DOCUMENT_SCORING_LUT_TILE_Q;
+            __syncthreads();
+            const float* source = d_lut + q_start * LUT_ENTRIES_PER_QUERY;
+            for (int i = threadIdx.x; i < DOCUMENT_SCORING_LUT_SMEM_FLOATS; i += blockDim.x)
+                smem_lut[i] = source[i];
+            if (threadIdx.x < DOCUMENT_SCORING_LUT_TILE_Q)
+                smem_cb1_sumq[threadIdx.x] = d_cb1_sumq[q_start + threadIdx.x];
+            __syncthreads();
+            if (valid) {
+                float ip[DOCUMENT_SCORING_LUT_TILE_Q] = {};
+                #pragma unroll 1
+                for (int c = 0; c < NUM_CHUNKS; ++c) {
+                    const uint64_t packed = c < 16 ? code0 : code1;
+                    const int nibble = static_cast<int>((packed >> ((c & 15) * 4)) & 15);
+                    const int address = c * LUT_SIZE + nibble;
+                    #pragma unroll
+                    for (int tq = 0; tq < DOCUMENT_SCORING_LUT_TILE_Q; ++tq)
+                        ip[tq] += smem_lut[tq * LUT_ENTRIES_PER_QUERY + address];
+                }
+                #pragma unroll
+                for (int tq = 0; tq < DOCUMENT_SCORING_LUT_TILE_Q; ++tq)
+                    d_one_bit_scores[static_cast<size_t>(q_start + tq) * total_tokens + tok] =
+                        (ip[tq] - smem_cb1_sumq[tq]) * factor;
+            }
+        }
+    }
+}
+
 __global__ void one_bit_document_score_kernel(
     const float*  __restrict__ d_one_bit_token_scores,
     const size_t* __restrict__ d_refined_doc_offsets,
@@ -577,6 +639,51 @@ __global__ void one_bit_document_score_kernel(
 
 
 
+// Four warps scan four query rows at a time. Token reads are contiguous
+// within each warp; only one CTA-wide barrier is required per document.
+__global__ void one_bit_document_score_fast_kernel(
+    const float* __restrict__ token_scores,
+    const size_t* __restrict__ document_offsets,
+    float* document_scores,
+    size_t total_tokens,
+    size_t num_documents
+) {
+    static_assert(Q_DOCLEN == 32, "Fast document reduction requires Q32");
+    const size_t doc = blockIdx.x;
+    if (doc >= num_documents) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const size_t begin = document_offsets[doc];
+    const size_t end = document_offsets[doc + 1];
+    __shared__ float max_per_query[32];
+
+    #pragma unroll
+    for (int q = warp; q < 32; q += 4) {
+        float maximum = -FLT_MAX;
+        const float* row = token_scores + static_cast<size_t>(q) * total_tokens;
+        for (size_t token = begin + lane; token < end; token += 32)
+            maximum = fmaxf(maximum, row[token]);
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride >>= 1)
+            maximum = fmaxf(maximum,
+                           __shfl_down_sync(0xffffffffu, maximum, stride));
+        if (lane == 0) max_per_query[q] = maximum;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        // Preserve original my_sum = 0+max and its stride64/32 zero adds.
+        // Then shuffle the identical stride16/8/4/2/1 cross-query pairs.
+        float sum = __fadd_rn(0.0f, max_per_query[lane]);
+        sum = __fadd_rn(sum, 0.0f);
+        sum = __fadd_rn(sum, 0.0f);
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride >>= 1)
+            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, stride));
+        if (lane == 0) document_scores[doc] = sum;
+    }
+}
+
 __global__ void gather_refined_token_positions_kernel(
     const int*    __restrict__ d_refined_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
@@ -606,7 +713,8 @@ __global__ void gather_refined_doc_lengths_kernel(
     const int* __restrict__ d_refined_doc_ids,
     const int* __restrict__ d_doc_ptrs,
     int*       d_doc_lengths,
-    size_t num_refined_candidates
+    size_t num_refined_candidates,
+    int* mapped_refined_doc_ids
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_refined_candidates) return;
@@ -614,6 +722,7 @@ __global__ void gather_refined_doc_lengths_kernel(
     int doc_id = d_refined_doc_ids[idx];
     int doc_len = d_doc_ptrs[doc_id + 1] - d_doc_ptrs[doc_id];
     d_doc_lengths[idx] = doc_len;
+    if (mapped_refined_doc_ids != nullptr) mapped_refined_doc_ids[idx] = doc_id;
 }
 
 

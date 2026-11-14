@@ -8,9 +8,12 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <cstdint>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -20,6 +23,14 @@
 
 using Clock = std::chrono::steady_clock;
 using Ids = std::vector<std::vector<size_t>>;
+// Pressure samples use the same Linux monotonic epoch, unlike wall-clock UTC.
+static uint64_t monotonic_ns() {
+    timespec value{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &value) != 0)
+        throw std::runtime_error("CLOCK_MONOTONIC read failed");
+    return uint64_t(value.tv_sec) * 1000000000ull + uint64_t(value.tv_nsec);
+}
+
 static double elapsed(Clock::time_point t) {
     return std::chrono::duration<double, std::milli>(Clock::now()-t).count();
 }
@@ -64,18 +75,25 @@ static void require_rows(const Ids& rows, size_t count, size_t k) {
 }
 int main(int argc,char** argv) try {
     std::string index_path, query_path, output_path, worker_list="1,2,4,8";
-    size_t batch=32, rounds=3, limit=0, k=10;
+    size_t batch=32, rounds=3, limit=0, k=10, query_repeats=1;
     bool batch_only=false, profile_range=false;
+    std::string cagra_memory="device";
     Chimera::SearchOptions options;
     options.nprobe=32; options.k_refine=1000; options.k_full_bit=20;
     options.cagra_itopk_size=64; options.num_chunks=1;
     for(int i=1;i<argc;++i) {
         std::string arg=argv[i];
         if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;continue; }
+        if(arg=="--compact-token-score") { options.compact_token_score=true;continue; }
+        if(arg=="--fast-document-reduce") { options.fast_document_reduce=true;continue; }
+        if(arg=="--uma-cpu-refine") { options.uma_cpu_refine=true; options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
+        if(arg=="--uma-cpu-candidates") { options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
+        if(arg=="--uma-query-buffers") { options.uma_query_buffers=true;continue; }
+        if(arg=="--verify-full-bit") { options.verify_full_bit=true;continue; }
         if(arg=="--batch-only") { batch_only=true;continue; }
         if(arg=="--profile-range") { profile_range=true;continue; }
         if(arg=="--help") {
-            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8 --batch-size 32 --rounds 3 --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit --batch-only --profile-range]\n";
+            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8,10 --batch-size 32 --rounds 3 --query-repeats 1 --compact-token-score --fast-document-reduce --uma-query-buffers --uma-cpu-candidates --uma-cpu-refine --cagra-memory device|ats-dataset|ats-both --verify-full-bit --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit --batch-only --profile-range]\n";
             return 0;
         }
         if(++i>=argc)throw std::invalid_argument("Missing value for "+arg);
@@ -84,8 +102,16 @@ int main(int argc,char** argv) try {
         else if(arg=="--queries")query_path=value;
         else if(arg=="--output")output_path=value;
         else if(arg=="--workers")worker_list=value;
+        else if(arg=="--cagra-memory") {
+            cagra_memory=value;
+            if(value=="device") options.cagra_memory_placement=Chimera::CagraMemoryPlacement::Device;
+            else if(value=="ats-dataset") options.cagra_memory_placement=Chimera::CagraMemoryPlacement::AtsDataset;
+            else if(value=="ats-both") options.cagra_memory_placement=Chimera::CagraMemoryPlacement::AtsDatasetAndGraph;
+            else throw std::invalid_argument("CAGRA memory must be device, ats-dataset or ats-both");
+        }
         else if(arg=="--batch-size")batch=std::stoull(value);
         else if(arg=="--rounds")rounds=std::stoull(value);
+        else if(arg=="--query-repeats")query_repeats=std::stoull(value);
         else if(arg=="--limit")limit=std::stoull(value);
         else if(arg=="--topk")k=std::stoull(value);
         else if(arg=="--nprobe")options.nprobe=std::stoi(value);
@@ -94,8 +120,8 @@ int main(int argc,char** argv) try {
         else if(arg=="--itopk")options.cagra_itopk_size=std::stoi(value);
         else throw std::invalid_argument("Unknown option "+arg);
     }
-    if(index_path.empty()||query_path.empty()||output_path.empty()||!batch||!rounds||!k)
-        throw std::invalid_argument("Require index, queries, output, positive batch/rounds/topk");
+    if(index_path.empty()||query_path.empty()||output_path.empty()||!batch||!rounds||!k||!query_repeats)
+        throw std::invalid_argument("Require index, queries, output, positive batch/rounds/topk/query-repeats");
     std::vector<size_t> workers;
     std::istringstream input(worker_list); std::string part;
     while(std::getline(input,part,',')) {
@@ -108,6 +134,9 @@ int main(int argc,char** argv) try {
     auto queries=read_queries(query_path,n,len,dim);
     if(len!=Q_DOCLEN || dim!=128)throw std::invalid_argument("Expected Q32 D128 queries");
     if(limit)n=std::min(n,limit);
+    if(query_repeats>std::numeric_limits<size_t>::max()/n)
+        throw std::invalid_argument("Timed query count overflows size_t");
+    const size_t timed_queries=n*query_repeats;
     const size_t stride=len*dim, check_n=std::min(n,size_t(32));
     Chimera::chimera_index index;
     Chimera::LoadOptions load; load.low_memory=true;
@@ -123,18 +152,28 @@ int main(int argc,char** argv) try {
     const std::string partial_path=output_path+".partial";
     std::ofstream out(partial_path);
     if(!out)throw std::runtime_error("Cannot open output");
-    out << std::setprecision(12) << "{\"queries\":" << n << ",\"query_length\":"<<len
+    out << std::setprecision(12) << "{\"queries\":" << timed_queries
+        <<",\"distinct_queries\":"<<n<<",\"query_repeats\":"<<query_repeats
+        << ",\"query_length\":"<<len
         <<",\"dimension\":"<<dim<<",\"topk\":"<<k<<",\"batch_size\":"<<batch
         <<",\"rounds\":"<<rounds<<",\"nprobe\":"<<options.nprobe
         <<",\"k_refine\":"<<options.k_refine<<",\"k_full_bit\":"<<options.k_full_bit
         <<",\"cagra_itopk_size\":"<<options.cagra_itopk_size<<",\"chunks\":1"
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
+        <<",\"compact_token_score\":"<<(options.compact_token_score?"true":"false")
+        <<",\"fast_document_reduce\":"<<(options.fast_document_reduce?"true":"false")
+        <<",\"cagra_memory\":\""<<cagra_memory<<"\""
+        <<",\"uma_cpu_refine\":"<<(options.uma_cpu_refine?"true":"false")
+        <<",\"uma_cpu_candidates\":"<<(options.uma_cpu_candidates?"true":"false")
+        <<",\"uma_query_buffers\":"<<(options.uma_query_buffers?"true":"false")
+        <<",\"verify_full_bit\":"<<(options.verify_full_bit?"true":"false")
         <<",\"batch_only\":"<<(batch_only?"true":"false")
         <<",\"profile_range\":"<<(profile_range?"true":"false")
         <<",\"preflight_queries_per_point\":"<<n
         <<",\"warmup_queries_per_round\":"<<std::min(n,std::max(size_t(32),batch))
         <<",\"timing\":\"host FP32 queries to completed host IDs; QPS from whole query-loop wall time; no encoding/load/warmup/output/recall\""
-        <<",\"latency_unit\":\"batch completion ms, B1 per-query ms\",\"points\":[";
+        <<",\"latency_unit\":\"batch completion ms, B1 per-query ms\""
+        <<",\"round_window_clock\":\"CLOCK_MONOTONIC\",\"points\":[";
     bool first_point=true;
     // workers=0 denotes the original single-query API reference.
     std::vector<size_t> modes;
@@ -196,13 +235,15 @@ int main(int argc,char** argv) try {
             }
             Chimera::check_cuda(cudaDeviceSynchronize());
             std::vector<double> latencies;
-            Ids results(n);
+            Ids results(timed_queries);
             if(profile_range) {
                 index.set_profiling_enabled(true);
                 Chimera::check_cuda(cudaProfilerStart(), "Starting timed round capture");
             }
             if(profile_range) nvtxRangePushA("ChimeraBatch/measured_round");
+            const uint64_t monotonic_start_ns = monotonic_ns();
             const auto loop_start=Clock::now();
+            for(size_t repeat=0;repeat<query_repeats;++repeat) {
             for(size_t base=0;base<n;base+=(w?batch:1)) {
                 Chimera::ProfileRange call_range(profile_range, w ? "ChimeraBatch/batch" : "ChimeraBatch/B1");
                 const auto call_start=Clock::now();
@@ -210,31 +251,35 @@ int main(int argc,char** argv) try {
                     const size_t count=std::min(batch,n-base);
                     auto rows=index.search_batch(queries.data()+base*stride,count*stride,k,w);
                     latencies.push_back(elapsed(call_start));
-                    for(size_t q=0;q<count;++q)results[base+q]=std::move(rows[q]);
+                    for(size_t q=0;q<count;++q)results[repeat*n+base+q]=std::move(rows[q]);
                 } else {
-                    results[base]=index.search(queries.data()+base*stride,stride,k);
+                    results[repeat*n+base]=index.search(queries.data()+base*stride,stride,k);
                     latencies.push_back(elapsed(call_start));
                 }
             }
+            }
             Chimera::check_cuda(cudaDeviceSynchronize());
             const double wall_ms=elapsed(loop_start);
+            const uint64_t monotonic_end_ns = monotonic_ns();
             if(profile_range) {
                 nvtxRangePop();
                 Chimera::check_cuda(cudaProfilerStop(), "Stopping timed round capture");
                 index.set_profiling_enabled(false);
             }
-            require_rows(results,n,k);
+            require_rows(results,timed_queries,k);
             const double search_ms=std::accumulate(latencies.begin(),latencies.end(),0.0);
             std::sort(latencies.begin(),latencies.end());
             const double p99=latencies[std::min(latencies.size()-1,size_t(std::ceil(latencies.size()*0.99)-1))];
             if(round)out<<',';
-            out << "{\"round\":"<<round+1<<",\"completed_queries\":"<<n<<",\"loop_wall_ms\":"<<wall_ms
-                <<",\"search_ms\":"<<search_ms<<",\"qps\":"<<n*1000.0/wall_ms
+            out << "{\"round\":"<<round+1<<",\"completed_queries\":"<<timed_queries
+                <<",\"monotonic_start_ns\":"<<monotonic_start_ns
+                <<",\"monotonic_end_ns\":"<<monotonic_end_ns<<",\"loop_wall_ms\":"<<wall_ms
+                <<",\"search_ms\":"<<search_ms<<",\"qps\":"<<timed_queries*1000.0/wall_ms
                 <<",\"batch_latency_mean_ms\":"<<search_ms/latencies.size()<<",\"batch_latency_p99_ms\":"<<p99
                 <<",\"result_ids\":";
             write_ids(out,results); out << '}'; out.flush();
             std::cout << "[RESULT] mode="<<(w?"batch":"B1")<<" workers="<<w<<" round="<<round+1
-                      <<" completed="<<n<<" qps="<<n*1000.0/wall_ms<<" batch_mean_ms="<<search_ms/latencies.size()
+                      <<" completed="<<timed_queries<<" qps="<<timed_queries*1000.0/wall_ms<<" batch_mean_ms="<<search_ms/latencies.size()
                       <<" batch_p99_ms="<<p99<<std::endl;
         }
         out << "],\"point_wall_ms\":"<<elapsed(point_start)<<'}'; out.flush();

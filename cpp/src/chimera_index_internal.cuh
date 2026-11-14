@@ -12,6 +12,16 @@
 namespace Chimera {
 
 struct chimera_index::Workspace {
+    // Actual enabled state; set only after verifying ATS/host-page-table access.
+    bool uma_query_buffers = false;
+    uint32_t* h_cpu_candidate_bitmap = nullptr;
+    uint32_t* h_cpu_cagra_labels = nullptr;
+    int* h_cpu_materialized_ids = nullptr;
+    float* h_cpu_refine_scores = nullptr;
+    std::vector<size_t> cpu_refine_order;
+    int* d_mapped_refined_doc_ids = nullptr;
+    int* h_refined_doc_lengths = nullptr;
+    uint32_t* h_candidate_bitmap_offsets = nullptr;
     std::unique_ptr<FlatL2Router> flat_router;
     const char* gpu_full_codes = nullptr;
     const float* gpu_full_factors = nullptr;
@@ -28,6 +38,8 @@ struct chimera_index::Workspace {
     int* d_refined_doc_lengths = nullptr;
     float* d_one_bit_token_scores = nullptr;
     float* d_one_bit_document_scores = nullptr;
+    float* d_document_reduce_reference = nullptr;  // Diagnostic only.
+    float* h_document_reduce_reference = nullptr;
     float* d_lut = nullptr;
     float* d_cagra_dists = nullptr;
     uint32_t* d_cagra_labels = nullptr;

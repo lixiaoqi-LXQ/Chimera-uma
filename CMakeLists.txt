@@ -135,3 +135,8 @@ set_target_properties(fullbit_gpu_qualification PROPERTIES CUDA_SEPARABLE_COMPIL
 add_executable(batch_search_benchmark tests/batch_search.cpp)
 target_link_libraries(batch_search_benchmark PRIVATE chimera_core)
 set_target_properties(batch_search_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# Explicit correctness executable; never runs as part of compilation.
+add_executable(token_score_qualification tests/token_score.cu)
+target_link_libraries(token_score_qualification PRIVATE chimera_core)
+set_target_properties(token_score_qualification PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

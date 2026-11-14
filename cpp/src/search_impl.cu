@@ -10,6 +10,8 @@
 
 #include "chimera/config.cuh"
 #include "chimera/chunk_partition.hpp"
+#include "chimera/cpu_candidate_generation.hpp"
+#include "chimera/cpu_refine_topk.hpp"
 #include "chimera/profiling.hpp"
 #include "chimera/ivf_pg.hpp"
 #include "chimera/kernels.cuh"
@@ -18,6 +20,12 @@
 #include "rabitqlib/utils/space.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <omp.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <cstring>
+#include <iostream>
 #include "rabitqlib/utils/chimera_simd.hpp"
 #include <limits>
 #include <numeric>
@@ -72,25 +80,40 @@ std::vector<size_t> chimera_index::search(
 }
 
 std::vector<size_t> chimera_index::search_one(const float* queries, size_t k) {
+    if (profiling_enabled_) {
+        static thread_local bool named = false;
+        if (!named) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "Chimera_lane_%d", omp_get_thread_num());
+            nvtxNameOsThreadA(static_cast<uint32_t>(::syscall(SYS_gettid)), name);
+            named = true;
+        }
+    }
+    std::vector<QueryState> query_states;
+    {
+    ProfileRange cpu_prepare(profiling_enabled_, "Chimera/cpu_query_prepare");
     for (size_t i = 0; i < Q_DOCLEN; ++i) {
         rotator_->rotate(&queries[i * d], &ws_->h_pinned_queries[i * PADDED_DIM]);
     }
 
-    std::vector<QueryState> query_states(Q_DOCLEN);
+    query_states.resize(Q_DOCLEN);
     for (size_t i = 0; i < Q_DOCLEN; ++i) {
         query_states[i] =
             QueryState(&ws_->h_pinned_queries[i * PADDED_DIM], PADDED_DIM, ex_bits);
         ws_->h_pinned_cb1_sumq[i] = query_states[i].cb1_sumq;
     }
+    }
 
-    check_cuda(cudaMemcpyAsync(ws_->d_queries, ws_->h_pinned_queries,
-                               Q_DOCLEN * PADDED_DIM * sizeof(float),
-                               cudaMemcpyHostToDevice, ws_->stream_h2d));
-    check_cuda(cudaMemcpyAsync(ws_->d_cb1_sumq, ws_->h_pinned_cb1_sumq,
-                               Q_DOCLEN * sizeof(float),
-                               cudaMemcpyHostToDevice, ws_->stream_h2d));
-    check_cuda(cudaEventRecord(ws_->event_h2d_done, ws_->stream_h2d));
-    check_cuda(cudaStreamWaitEvent(ws_->stream_compute, ws_->event_h2d_done));
+    if (!ws_->uma_query_buffers) {
+        check_cuda(cudaMemcpyAsync(ws_->d_queries, ws_->h_pinned_queries,
+                                   Q_DOCLEN * PADDED_DIM * sizeof(float),
+                                   cudaMemcpyHostToDevice, ws_->stream_h2d));
+        check_cuda(cudaMemcpyAsync(ws_->d_cb1_sumq, ws_->h_pinned_cb1_sumq,
+                                   Q_DOCLEN * sizeof(float),
+                                   cudaMemcpyHostToDevice, ws_->stream_h2d));
+        check_cuda(cudaEventRecord(ws_->event_h2d_done, ws_->stream_h2d));
+        check_cuda(cudaStreamWaitEvent(ws_->stream_compute, ws_->event_h2d_done));
+    }
 
     precompute_one_bit_lut_kernel<<<Q_DOCLEN, 256, 0, ws_->stream_compute>>>(
         ws_->d_queries, ws_->d_lut);
@@ -123,12 +146,19 @@ void chimera_index::generate_and_refine_candidates(
     int& num_refined_candidates,
     cudaStream_t stream) {
     ProfileRange range(profiling_enabled_, "Chimera/candidate_generation_refinement");
-    check_cuda(cudaMemsetAsync(d_candidate_bitmap_, 0,
-                               candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t),
-                               ws_->stream_d2h));
-    check_cuda(cudaMemsetAsync(d_candidate_bitmap_offsets_, 0,
-                               candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t),
-                               ws_->stream_d2h));
+    if (!options_.uma_cpu_candidates)
+        check_cuda(cudaMemsetAsync(d_candidate_bitmap_, 0,
+                                   candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t),
+                                   ws_->stream_d2h));
+    if (ws_->uma_query_buffers) {
+        // The count kernel overwrites every group count. Only the final scan
+        // sentinel needs resetting; the previous synchronous query is done.
+        ws_->h_candidate_bitmap_offsets[candidate_bitmap_offset_count_ - 1] = 0;
+    } else {
+        check_cuda(cudaMemsetAsync(d_candidate_bitmap_offsets_, 0,
+                                   candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t),
+                                   ws_->stream_d2h));
+    }
     check_cuda(cudaEventRecord(ws_->event_h2d_done, ws_->stream_d2h));
 
     {
@@ -156,6 +186,19 @@ void chimera_index::generate_and_refine_candidates(
         16);
     const dim3 grid(blocks_x, Q_DOCLEN);
 
+    candidate_bitmap_offset_t num_candidate_docs_u32 = 0;
+    if (options_.uma_cpu_candidates) {
+        // CAGRA publishes labels into ATS; all subsequent CPU writes are
+        // published before the same stream's dependent GPU launches.
+        check_cuda(cudaStreamSynchronize(stream));
+        ProfileRange cpu_cg(profiling_enabled_, "Chimera/uma_cpu_candidates");
+        num_candidate_docs_u32 = cpu_generate_candidates(
+            ws_->h_cpu_cagra_labels, size_t(Q_DOCLEN) * nprobe,
+            ivf->cluster_pos.data(), ivf->n_clusters, d_clustered_doc_ids_, num_docs,
+            ws_->h_cpu_candidate_bitmap, candidate_bitmap_bucket_count_,
+            ws_->h_candidate_bitmap_offsets, ws_->h_cpu_materialized_ids,
+            max_candidate_docs_);
+    } else {
     mark_candidate_documents_kernel<<<grid, threads_per_block, 0, stream>>>(
         ws_->d_cagra_labels,
         d_cluster_pos_,
@@ -176,22 +219,36 @@ void chimera_index::generate_and_refine_candidates(
             d_candidate_bitmap_offsets_);
     check_cuda(cudaGetLastError());
 
-    size_t scan_temp = ws_->cub_temp_storage_bytes;
-    cub::DeviceScan::ExclusiveSum(
-        ws_->d_cub_temp_storage,
-        scan_temp,
-        d_candidate_bitmap_offsets_,
-        d_candidate_bitmap_offsets_,
-        candidate_bitmap_offset_count_,
-        stream);
+    if (ws_->uma_query_buffers) {
+        // count_candidate_bitmap_kernel overwrites all group counts. Wait for
+        // those GPU writes, then scan the same ATS-visible storage on the CPU.
+        // The sentinel input is zero, so its exclusive prefix is the doc count.
+        check_cuda(cudaStreamSynchronize(stream));
+        candidate_bitmap_offset_t prefix = 0;
+        for (size_t i = 0; i < candidate_bitmap_offset_count_; ++i) {
+            const candidate_bitmap_offset_t count = ws_->h_candidate_bitmap_offsets[i];
+            ws_->h_candidate_bitmap_offsets[i] = prefix;
+            prefix += count;
+        }
+        num_candidate_docs_u32 = ws_->h_candidate_bitmap_offsets[candidate_bitmap_offset_count_ - 1];
+    } else {
+        size_t scan_temp = ws_->cub_temp_storage_bytes;
+        cub::DeviceScan::ExclusiveSum(
+            ws_->d_cub_temp_storage,
+            scan_temp,
+            d_candidate_bitmap_offsets_,
+            d_candidate_bitmap_offsets_,
+            candidate_bitmap_offset_count_,
+            stream);
+        check_cuda(cudaMemcpyAsync(&num_candidate_docs_u32,
+                                   d_candidate_bitmap_offsets_ + candidate_bitmap_offset_count_ - 1,
+                                   sizeof(candidate_bitmap_offset_t),
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
+        check_cuda(cudaStreamSynchronize(stream));
+    }
 
-    candidate_bitmap_offset_t num_candidate_docs_u32 = 0;
-    check_cuda(cudaMemcpyAsync(&num_candidate_docs_u32,
-                               d_candidate_bitmap_offsets_ + candidate_bitmap_offset_count_ - 1,
-                               sizeof(candidate_bitmap_offset_t),
-                               cudaMemcpyDeviceToHost,
-                               stream));
-    check_cuda(cudaStreamSynchronize(stream));
+    }
 
     const int num_candidate_docs = static_cast<int>(num_candidate_docs_u32);
     if (num_candidate_docs == 0) {
@@ -211,6 +268,60 @@ void chimera_index::generate_and_refine_candidates(
                                static_cast<size_t>(num_candidate_docs) * Q_DOCLEN * sizeof(float),
                                stream));
 
+    if (options_.uma_cpu_candidates && options_.verify_full_bit) {
+        // Diagnostic only: run the original GPU integer pipeline on independent
+        // buffers. This path is excluded from all throughput measurements.
+        struct Reference {
+            uint32_t* bitmap = nullptr;
+            uint32_t* offsets = nullptr;
+            int* ids = nullptr;
+            ~Reference() { (void)cudaFree(bitmap); (void)cudaFree(offsets); (void)cudaFree(ids); }
+        } ref;
+        check_cuda(cudaMalloc(&ref.bitmap, candidate_bitmap_bucket_count_ * sizeof(uint32_t)));
+        check_cuda(cudaMalloc(&ref.offsets, candidate_bitmap_offset_count_ * sizeof(uint32_t)));
+        check_cuda(cudaMalloc(&ref.ids, size_t(num_candidate_docs) * sizeof(int)));
+        check_cuda(cudaMemsetAsync(ref.bitmap, 0, candidate_bitmap_bucket_count_ * sizeof(uint32_t), stream));
+        check_cuda(cudaMemsetAsync(ref.offsets, 0, candidate_bitmap_offset_count_ * sizeof(uint32_t), stream));
+        mark_candidate_documents_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_->d_cagra_labels, d_cluster_pos_, d_clustered_doc_ids_, ref.bitmap,
+            num_docs, static_cast<int>(nprobe), ivf->n_clusters);
+        check_cuda(cudaGetLastError());
+        count_candidate_bitmap_kernel<<<
+            (candidate_bitmap_bucket_count_ + threads_per_block - 1) / threads_per_block,
+            threads_per_block, 0, stream>>>(ref.bitmap, candidate_bitmap_bucket_count_, ref.offsets);
+        check_cuda(cudaGetLastError());
+        size_t scan_temp = ws_->cub_temp_storage_bytes;
+        cub::DeviceScan::ExclusiveSum(ws_->d_cub_temp_storage, scan_temp, ref.offsets,
+            ref.offsets, candidate_bitmap_offset_count_, stream);
+        // First compare count; an incorrect reference count must not overrun IDs.
+        uint32_t reference_count = 0;
+        check_cuda(cudaMemcpyAsync(&reference_count, ref.offsets + candidate_bitmap_offset_count_ - 1,
+            sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        check_cuda(cudaStreamSynchronize(stream));
+        if (reference_count != num_candidate_docs_u32)
+            throw std::runtime_error("UMA CPU CG count differs from GPU reference");
+        materialize_candidate_documents_kernel<<<
+            (candidate_bitmap_bucket_count_ + threads_per_block - 1) / threads_per_block,
+            threads_per_block, 0, stream>>>(ref.bitmap, candidate_bitmap_bucket_count_, ref.offsets, ref.ids);
+        check_cuda(cudaGetLastError());
+        std::vector<uint32_t> host_bitmap(candidate_bitmap_bucket_count_);
+        std::vector<uint32_t> host_offsets(candidate_bitmap_offset_count_);
+        std::vector<int> host_ids(num_candidate_docs);
+        check_cuda(cudaMemcpyAsync(host_bitmap.data(), ref.bitmap, host_bitmap.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        check_cuda(cudaMemcpyAsync(host_offsets.data(), ref.offsets, host_offsets.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        check_cuda(cudaMemcpyAsync(host_ids.data(), ref.ids, host_ids.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        check_cuda(cudaStreamSynchronize(stream));
+        if (std::memcmp(host_bitmap.data(), ws_->h_cpu_candidate_bitmap, host_bitmap.size() * sizeof(uint32_t)) ||
+            std::memcmp(host_offsets.data(), ws_->h_candidate_bitmap_offsets, host_offsets.size() * sizeof(uint32_t)) ||
+            std::memcmp(host_ids.data(), ws_->h_cpu_materialized_ids, host_ids.size() * sizeof(int)))
+            throw std::runtime_error("UMA CPU CG bitmap/prefix/IDs differ from GPU reference");
+        std::cout << "[UMA_CANDIDATES_VERIFY] candidates=" << num_candidate_docs
+                  << " bitmap_prefix_ids_bitwise=passed\n";
+    }
+    // Keep a local pointer: ensure_candidate_capacity rebinds the arena alias.
+    int* materialized_ids = options_.uma_cpu_candidates
+        ? ws_->h_cpu_materialized_ids : ws_->d_materialized_candidate_doc_ids;
+    if (!options_.uma_cpu_candidates) {
     materialize_candidate_documents_kernel<<<
         (candidate_bitmap_bucket_count_ + threads_per_block - 1) / threads_per_block,
         threads_per_block,
@@ -222,12 +333,14 @@ void chimera_index::generate_and_refine_candidates(
             ws_->d_materialized_candidate_doc_ids);
     check_cuda(cudaGetLastError());
 
+    }
+
     if (skips_candidate_refinement(options_.algorithm_variant)) {
         // True no-CR: every materialized CG document enters unchanged DS.
         ProfileRange bypass(profiling_enabled_, "Chimera/no_cr_all_candidates", num_candidate_docs);
         num_refined_candidates = num_candidate_docs;
-        check_cuda(cudaMemcpyAsync(ws_->d_candidate_doc_ids, ws_->d_materialized_candidate_doc_ids,
-                                   size_t(num_candidate_docs) * sizeof(int), cudaMemcpyDeviceToDevice, stream));
+        check_cuda(cudaMemcpyAsync(ws_->d_candidate_doc_ids, materialized_ids,
+                                   size_t(num_candidate_docs) * sizeof(int), (options_.uma_cpu_candidates ? cudaMemcpyDefault : cudaMemcpyDeviceToDevice), stream));
         return;
     }
 
@@ -255,17 +368,56 @@ void chimera_index::generate_and_refine_candidates(
     const int score_blocks =
         (num_candidate_docs + PARTIAL_SCORE_WARPS_PER_BLOCK - 1) /
         PARTIAL_SCORE_WARPS_PER_BLOCK;
+    float* partial_scores = options_.uma_cpu_refine
+        ? ws_->h_cpu_refine_scores : ws_->d_partial_scores;
     sum_partial_scores_kernel<<<score_blocks, thread_count, 0, stream>>>(
         ws_->d_partial_query_scores,
-        ws_->d_materialized_candidate_doc_ids,
-        ws_->d_partial_scores,
+        materialized_ids,
+        partial_scores,
         ws_->d_candidate_doc_ids,
         num_candidate_docs);
     check_cuda(cudaGetLastError());
+    if (options_.uma_cpu_refine) {
+        check_cuda(cudaStreamSynchronize(stream));
+        {
+            ProfileRange cpu_topk(profiling_enabled_, "Chimera/uma_cpu_refine");
+            cpu_refine_topk(partial_scores, materialized_ids, size_t(num_candidate_docs),
+                size_t(num_refined_candidates), ws_->cpu_refine_order.data(), ws_->h_refined_doc_ids);
+        }
+        if (options_.verify_full_bit) {
     cub::DeviceRadixSort::SortPairsDescending(
         ws_->d_cub_temp_storage,
         ws_->cub_temp_storage_bytes,
-        ws_->d_partial_scores,
+        partial_scores,
+        ws_->d_sorted_partial_scores,
+        ws_->d_candidate_doc_ids,
+        ws_->d_sorted_candidate_doc_ids,
+        num_candidate_docs,
+        0,
+        32,
+        stream);
+    check_cuda(cudaGetLastError());
+            std::vector<int> reference_ids(num_refined_candidates);
+            std::vector<float> reference_scores(num_refined_candidates);
+            check_cuda(cudaMemcpyAsync(reference_ids.data(), ws_->d_sorted_candidate_doc_ids,
+                size_t(num_refined_candidates) * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            check_cuda(cudaMemcpyAsync(reference_scores.data(), ws_->d_sorted_partial_scores,
+                size_t(num_refined_candidates) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            check_cuda(cudaStreamSynchronize(stream));
+            for (int i = 0; i < num_refined_candidates; ++i) {
+                const float selected = partial_scores[cpu_refine_row(ws_->cpu_refine_order[size_t(i)])];
+                if (reference_ids[size_t(i)] != ws_->h_refined_doc_ids[i] ||
+                    std::memcmp(&selected, &reference_scores[size_t(i)], sizeof(float)))
+                    throw std::runtime_error("UMA CPU top-k differs from CUB reference IDs/score bits");
+            }
+            std::cout << "[UMA_REFINE_VERIFY] candidates=" << num_candidate_docs
+                      << " selected=" << num_refined_candidates << " ids_scores_bitwise=passed\n";
+        }
+    } else {
+    cub::DeviceRadixSort::SortPairsDescending(
+        ws_->d_cub_temp_storage,
+        ws_->cub_temp_storage_bytes,
+        partial_scores,
         ws_->d_sorted_partial_scores,
         ws_->d_candidate_doc_ids,
         ws_->d_sorted_candidate_doc_ids,
@@ -279,6 +431,7 @@ void chimera_index::generate_and_refine_candidates(
                                num_refined_candidates * sizeof(int),
                                cudaMemcpyDeviceToDevice,
                                stream));
+    }
 }
 
 void chimera_index::collaborative_document_scoring(
@@ -300,31 +453,57 @@ void chimera_index::collaborative_document_scoring(
     const int full_bit_target = static_cast<int>(
         std::min(k_full_bit, static_cast<size_t>(num_refined_candidates)));
 
-    // Prepare the refined candidate documents for collaborative scoring.
-    int threads = 256;
-    int blocks = (num_refined_candidates + threads - 1) / threads;
+    const int* refined_ids = options_.uma_cpu_refine
+        ? ws_->h_refined_doc_ids : ws_->d_candidate_doc_ids;
+    size_t total_tokens = 0;
+    if (options_.uma_cpu_refine) {
+        // Selected IDs already belong to the CPU. Derive the tiny metadata
+        // directly; do not round-trip to a GPU length gather and host wait.
+        ProfileRange metadata(profiling_enabled_, "Chimera/uma_cpu_refined_metadata");
+        const auto& ptrs = corpus().doc_ptrs_;
+        ws_->h_pinned_refined_doc_offsets[0] = 0;
+        for (int i = 0; i < num_refined_candidates; ++i) {
+            const int doc = refined_ids[i];
+            total_tokens += static_cast<size_t>(ptrs[doc + 1] - ptrs[doc]);
+            ws_->h_pinned_refined_doc_offsets[i + 1] = total_tokens;
+        }
+    } else {
+        // Prepare the refined candidate documents for collaborative scoring.
+        int threads = 256;
+        int blocks = (num_refined_candidates + threads - 1) / threads;
 
-    gather_refined_doc_lengths_kernel<<<blocks, threads, 0, stream>>>(
-        ws_->d_candidate_doc_ids, d_doc_ptrs_,
-        ws_->d_refined_doc_lengths,
-        num_refined_candidates
-    );
-    check_cuda(cudaGetLastError());
+        gather_refined_doc_lengths_kernel<<<blocks, threads, 0, stream>>>(
+            refined_ids, d_doc_ptrs_,
+            ws_->d_refined_doc_lengths,
+            num_refined_candidates,
+            options_.uma_cpu_refine ? nullptr : ws_->d_mapped_refined_doc_ids
+        );
+        check_cuda(cudaGetLastError());
 
-    check_cuda(cudaMemsetAsync(ws_->d_refined_doc_offsets, 0, sizeof(size_t), stream));
-    {
-        thrust::device_ptr<int> len_ptr(ws_->d_refined_doc_lengths);
-        auto xform_iter = thrust::make_transform_iterator(len_ptr, cast_int_size_t());
-        size_t scan_temp = ws_->cub_temp_storage_bytes;
-        cub::DeviceScan::InclusiveScan(
-            ws_->d_cub_temp_storage, scan_temp,
-            xform_iter, ws_->d_refined_doc_offsets + 1,
-            thrust::plus<size_t>(), num_refined_candidates, stream);
+        if (ws_->uma_query_buffers) {
+            // Lengths and mapped IDs were both written by the preceding gather.
+            // Move the existing metadata handoff here, before the CPU prefix sum.
+            check_cuda(cudaStreamSynchronize(stream));
+            ws_->h_pinned_refined_doc_offsets[0] = 0;
+            for (int i = 0; i < num_refined_candidates; ++i) {
+                total_tokens += static_cast<size_t>(ws_->h_refined_doc_lengths[i]);
+                ws_->h_pinned_refined_doc_offsets[i + 1] = total_tokens;
+            }
+        } else {
+            check_cuda(cudaMemsetAsync(ws_->d_refined_doc_offsets, 0, sizeof(size_t), stream));
+            thrust::device_ptr<int> len_ptr(ws_->d_refined_doc_lengths);
+            auto xform_iter = thrust::make_transform_iterator(len_ptr, cast_int_size_t());
+            size_t scan_temp = ws_->cub_temp_storage_bytes;
+            cub::DeviceScan::InclusiveScan(
+                ws_->d_cub_temp_storage, scan_temp,
+                xform_iter, ws_->d_refined_doc_offsets + 1,
+                thrust::plus<size_t>(), num_refined_candidates, stream);
+        }
     }
 
     gather_refined_token_positions_kernel<<<
         num_refined_candidates, 256, 0, stream>>>(
-        ws_->d_candidate_doc_ids,
+        refined_ids,
         d_doc_ptrs_,
         d_token_to_cluster_pos_,
         ws_->d_refined_doc_offsets,
@@ -333,29 +512,32 @@ void chimera_index::collaborative_document_scoring(
     );
     check_cuda(cudaGetLastError());
 
-    size_t total_tokens;
-    check_cuda(cudaMemcpyAsync(
-        ws_->h_num_refined_tokens,
-        ws_->d_refined_doc_offsets + num_refined_candidates,
-        sizeof(size_t),
-        cudaMemcpyDeviceToHost,
-        stream));
-    check_cuda(cudaMemcpyAsync(
-        ws_->h_pinned_refined_doc_offsets,
-        ws_->d_refined_doc_offsets,
-        (num_refined_candidates + 1) * sizeof(size_t),
-        cudaMemcpyDeviceToHost,
-        stream));
+    if (!ws_->uma_query_buffers) {
+        check_cuda(cudaMemcpyAsync(
+            ws_->h_num_refined_tokens,
+            ws_->d_refined_doc_offsets + num_refined_candidates,
+            sizeof(size_t),
+            cudaMemcpyDeviceToHost,
+            stream));
+        check_cuda(cudaMemcpyAsync(
+            ws_->h_pinned_refined_doc_offsets,
+            ws_->d_refined_doc_offsets,
+            (num_refined_candidates + 1) * sizeof(size_t),
+            cudaMemcpyDeviceToHost,
+            stream));
 
-    check_cuda(cudaMemcpyAsync(
-        ws_->h_refined_doc_ids,
-        ws_->d_candidate_doc_ids,
-        num_refined_candidates * sizeof(int),
-        cudaMemcpyDeviceToHost,
-        stream));
+        check_cuda(cudaMemcpyAsync(
+            ws_->h_refined_doc_ids,
+            refined_ids,
+            num_refined_candidates * sizeof(int),
+            cudaMemcpyDeviceToHost,
+            stream));
 
-    check_cuda(cudaStreamSynchronize(stream));
-    total_tokens = *ws_->h_num_refined_tokens;
+        check_cuda(cudaStreamSynchronize(stream));
+        total_tokens = *ws_->h_num_refined_tokens;
+    }
+    // UMA metadata is already CPU-ready. gather_refined_token_positions stays
+    // queued before scoring in the same compute stream; no extra host wait.
     const int* refined_doc_ids = ws_->h_refined_doc_ids;
 
     // Score the chunks on the GPU while completed chunks stream to the CPU.
@@ -391,6 +573,18 @@ void chimera_index::collaborative_document_scoring(
             const size_t lut_shared_memory =
                 DOCUMENT_SCORING_LUT_SMEM_FLOATS * sizeof(float) +
                 DOCUMENT_SCORING_LUT_TILE_Q * sizeof(float);
+            if (options_.compact_token_score) {
+                one_bit_token_score_compact_kernel<<<
+                token_blocks, 256, lut_shared_memory, stream>>>(
+                ws_->d_lut,
+                d_clustered_one_bit_codes_,
+                d_clustered_one_bit_factors_,
+                ws_->d_cb1_sumq,
+                ws_->d_refined_token_positions + token_start,
+                ws_->d_one_bit_token_scores + token_start,
+                total_tokens,
+                token_count);
+            } else {
             one_bit_token_score_kernel<<<
                 token_blocks, 256, lut_shared_memory, stream>>>(
                 ws_->d_lut,
@@ -401,30 +595,52 @@ void chimera_index::collaborative_document_scoring(
                 ws_->d_one_bit_token_scores + token_start,
                 total_tokens,
                 token_count);
+            }
             check_cuda(cudaGetLastError());
         }
 
         if (chunk_count > 0) {
-        one_bit_document_score_kernel<<<
-            chunk_count, score_threads, 0, stream>>>(
-            ws_->d_one_bit_token_scores,
-            ws_->d_refined_doc_offsets + chunk_start,
-            ws_->d_one_bit_document_scores + chunk_start,
-            total_tokens,
-            chunk_count);
-        check_cuda(cudaGetLastError());
+            if (options_.fast_document_reduce) {
+                one_bit_document_score_fast_kernel<<<chunk_count, 128, 0, stream>>>(
+                    ws_->d_one_bit_token_scores,
+                    ws_->d_refined_doc_offsets + chunk_start,
+                    ws_->d_one_bit_document_scores + chunk_start,
+                    total_tokens, chunk_count);
+                check_cuda(cudaGetLastError());
+                if (options_.verify_full_bit) {
+                    one_bit_document_score_kernel<<<chunk_count, score_threads, 0, stream>>>(
+                        ws_->d_one_bit_token_scores,
+                        ws_->d_refined_doc_offsets + chunk_start,
+                        ws_->d_document_reduce_reference + chunk_start,
+                        total_tokens, chunk_count);
+                    check_cuda(cudaGetLastError());
+                    check_cuda(cudaMemcpyAsync(
+                        ws_->h_document_reduce_reference + chunk_start,
+                        ws_->d_document_reduce_reference + chunk_start,
+                        chunk_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                }
+            } else {
+                one_bit_document_score_kernel<<<chunk_count, score_threads, 0, stream>>>(
+                    ws_->d_one_bit_token_scores,
+                    ws_->d_refined_doc_offsets + chunk_start,
+                    ws_->d_one_bit_document_scores + chunk_start,
+                    total_tokens, chunk_count);
+                check_cuda(cudaGetLastError());
+            }
         }
 
         check_cuda(cudaEventRecord(chunk_compute_done[chunk], stream));
 
-        check_cuda(cudaStreamWaitEvent(
-            stream_d2h, chunk_compute_done[chunk], 0));
-        if (chunk_count > 0) check_cuda(cudaMemcpyAsync(
-            ws_->h_mapped_one_bit_document_scores + chunk_start,
-            ws_->d_one_bit_document_scores + chunk_start,
-            chunk_count * sizeof(float),
-            cudaMemcpyDeviceToHost, stream_d2h));
-        check_cuda(cudaEventRecord(chunk_d2h_done[chunk], stream_d2h));
+        if (!ws_->uma_query_buffers) {
+            check_cuda(cudaStreamWaitEvent(
+                stream_d2h, chunk_compute_done[chunk], 0));
+            if (chunk_count > 0) check_cuda(cudaMemcpyAsync(
+                ws_->h_mapped_one_bit_document_scores + chunk_start,
+                ws_->d_one_bit_document_scores + chunk_start,
+                chunk_count * sizeof(float),
+                cudaMemcpyDeviceToHost, stream_d2h));
+            check_cuda(cudaEventRecord(chunk_d2h_done[chunk], stream_d2h));
+        }
     };
 
     for (int chunk = 0; chunk < num_chunks; ++chunk) {
@@ -448,9 +664,25 @@ void chimera_index::collaborative_document_scoring(
         const int chunk_count = chunk_end - chunk_start;
         {
             ProfileRange wait(profiling_enabled_, "Chimera/wait_chunk", chunk);
-            check_cuda(cudaEventSynchronize(chunk_d2h_done[chunk]));
+            check_cuda(cudaEventSynchronize(ws_->uma_query_buffers
+                ? chunk_compute_done[chunk] : chunk_d2h_done[chunk]));
         }
 
+        if (options_.fast_document_reduce && options_.verify_full_bit) {
+            for (int i = chunk_start; i < chunk_end; ++i) {
+                if (std::memcmp(&ws_->h_document_reduce_reference[i],
+                                &ws_->h_mapped_one_bit_document_scores[i], sizeof(float))) {
+                    throw std::runtime_error("Fast GPU document reduction differs from original at candidate " +
+                                             std::to_string(i));
+                }
+            }
+            std::cout << "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=" << chunk_count
+                      << " scores_fp32_bitwise=passed\n";
+        }
+
+        int num_full_bit_candidates = 0;
+        {
+        ProfileRange cpu_select(profiling_enabled_, "Chimera/cpu_candidate_select", chunk);
         std::iota(
             one_bit_score_order.begin() + previous_order_size,
             one_bit_score_order.begin() + previous_order_size + chunk_count,
@@ -493,8 +725,7 @@ void chimera_index::collaborative_document_scoring(
             newly_selected_candidates.begin(),
             newly_selected_candidates.end(),
             std::greater<>());
-        const int num_full_bit_candidates =
-            static_cast<int>(newly_selected_candidates.size());
+        num_full_bit_candidates = static_cast<int>(newly_selected_candidates.size());
         for (const auto& candidate : newly_selected_candidates) {
             const int doc_id = refined_doc_ids[candidate.second];
             seen_doc_map[doc_id] = true;
@@ -506,6 +737,8 @@ void chimera_index::collaborative_document_scoring(
                 newly_selected_candidates[i].second;
         }
 
+        }
+
         compute_full_bit_scores(
             refined_doc_ids,
             full_bit_candidate_indices.data(),
@@ -514,13 +747,18 @@ void chimera_index::collaborative_document_scoring(
             queries,
             full_bit_scores.data());
 
+        {
+        ProfileRange cpu_heap(profiling_enabled_, "Chimera/cpu_heap_insert", chunk);
         for (int i = 0; i < num_full_bit_candidates; ++i) {
             full_bit_result_heap.emplace(
                 full_bit_scores[i].first,
                 static_cast<size_t>(full_bit_scores[i].second));
         }
+        }
     }
 
+    {
+    ProfileRange cpu_final(profiling_enabled_, "Chimera/cpu_final_select");
     result.clear();
     last_result_scores_.clear();
     if (capture_scores_) last_result_scores_.reserve(k);
@@ -531,6 +769,7 @@ void chimera_index::collaborative_document_scoring(
     }
 
     for (int doc_id : seen_doc_list) seen_doc_map[doc_id] = false;
+    }
 
 }
 

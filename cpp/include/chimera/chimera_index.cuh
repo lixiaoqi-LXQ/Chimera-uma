@@ -51,8 +51,11 @@ enum class AlgorithmVariant { Full, NoCR, NoIVFPG, Neither };
 inline bool skips_candidate_refinement(AlgorithmVariant v) { return v == AlgorithmVariant::NoCR || v == AlgorithmVariant::Neither; }
 inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == AlgorithmVariant::NoIVFPG || v == AlgorithmVariant::Neither; }
 
+enum class CagraMemoryPlacement { Device, AtsDataset, AtsDatasetAndGraph };
+
 struct SearchOptions {
     AlgorithmVariant algorithm_variant = AlgorithmVariant::Full;
+    CagraMemoryPlacement cagra_memory_placement = CagraMemoryPlacement::Device;
     size_t expected_coarse_clusters = 0;
     int nprobe = 128;
     int k_refine = 3000;
@@ -61,6 +64,11 @@ struct SearchOptions {
     int num_chunks = 5;
     bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
+    bool compact_token_score = false;  // Independent opt-in bounded-register token scorer.
+    bool fast_document_reduce = false;  // Independent opt-in GPU warp document reduction.
+    bool uma_cpu_refine = false;  // CPU exact stable-radix-equivalent top-k.
+    bool uma_cpu_candidates = false;  // CPU integer candidate generation; requires UMA query buffers.
+    bool uma_query_buffers = false;  // Opt-in: ATS-coherent mapped query/metadata buffers.
 };
 
 inline void check_cuda(
@@ -284,6 +292,7 @@ class chimera_index {
     char* d_clustered_one_bit_codes_ = nullptr;
     float* d_clustered_one_bit_factors_ = nullptr;
     int* d_clustered_doc_ids_ = nullptr;
+    int* h_uma_clustered_doc_ids_ = nullptr;  // Corpus owner only; d_ aliases this ATS allocation.
     uint32_t* d_token_to_cluster_pos_ = nullptr;
 
     uint32_t* d_candidate_bitmap_ = nullptr;

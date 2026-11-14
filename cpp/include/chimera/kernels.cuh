@@ -31,12 +31,32 @@ __global__ void one_bit_token_score_kernel(
     size_t batch_tokens
 );
 
+__global__ void one_bit_token_score_compact_kernel(
+    const float* __restrict__ d_lut,
+    const char*  __restrict__ d_clustered_code,
+    const float* __restrict__ d_clustered_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_clustered_pos,
+    float* __restrict__ d_one_bit_scores,
+    size_t total_tokens,
+    size_t batch_tokens
+);
+
 __global__ void one_bit_document_score_kernel(
     const float*  __restrict__ d_one_bit_token_scores,
     const size_t* __restrict__ d_refined_doc_offsets,
     float*        d_one_bit_document_scores,
     size_t total_tokens,
     size_t num_refined_candidates
+);
+
+// Exactly 128 threads per CTA. Independent of UMA buffer placement.
+__global__ void one_bit_document_score_fast_kernel(
+    const float* __restrict__ token_scores,
+    const size_t* __restrict__ document_offsets,
+    float* document_scores,
+    size_t total_tokens,
+    size_t num_documents
 );
 
 __global__ void gather_refined_token_positions_kernel(
@@ -52,7 +72,8 @@ __global__ void gather_refined_doc_lengths_kernel(
     const int* __restrict__ d_refined_doc_ids,
     const int* __restrict__ d_doc_ptrs,
     int*       d_doc_lengths,
-    size_t num_refined_candidates
+    size_t num_refined_candidates,
+    int* mapped_refined_doc_ids = nullptr
 );
 
 using candidate_bitmap_bucket_t = uint32_t;

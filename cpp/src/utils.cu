@@ -21,6 +21,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -29,6 +32,22 @@
 namespace Chimera {
 
 namespace {
+
+// Ordinary CPU-cached storage, addressed directly through ATS host page tables.
+// This path is enabled only after checking pageableMemoryAccess/hostPageTables.
+// The host allocation is the only owner; neither alias is passed to cudaFree.
+template <typename T>
+void allocate_ats_buffer(T*& host, T*& device, size_t count) {
+    void* storage = nullptr;
+    const size_t bytes = count * sizeof(T);
+    if (::posix_memalign(&storage, 256, std::max(bytes, size_t(256))) != 0) {
+        throw std::bad_alloc();
+    }
+    host = static_cast<T*>(storage);
+    // Initialize and CPU-first-touch every page outside query timing.
+    std::memset(host, 0, bytes);
+    device = host;
+}
 
 struct cast_int_size_t {
     __host__ __device__ size_t operator()(int value) const {
@@ -310,6 +329,17 @@ void chimera_index::ensure_candidate_capacity(size_t required_rows) {
 }
 
 void chimera_index::allocate_workspace() {
+    if (options_.uma_query_buffers) {
+        int device = 0, pageable = 0, host_tables = 0;
+        check_cuda(cudaGetDevice(&device));
+        check_cuda(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device));
+        check_cuda(cudaDeviceGetAttribute(&host_tables,
+                   cudaDevAttrPageableMemoryAccessUsesHostPageTables, device));
+        if (!pageable || !host_tables) {
+            throw std::runtime_error("UMA query buffers require ATS host-page-table access");
+        }
+        ws_->uma_query_buffers = true;
+    }
     ws_->max_full_bit_candidates = options_.k_full_bit;
     const size_t max_scored_candidate_docs = std::min(
         static_cast<size_t>(num_docs),
@@ -355,16 +385,44 @@ void chimera_index::allocate_workspace() {
         candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t);
     configure_cagra_workspace(*cagra_res_, estimated_size);
 
-    check_cuda(cudaMalloc(&ws_->d_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
-    check_cuda(cudaMalloc(&ws_->d_cb1_sumq, Q_DOCLEN * sizeof(float)));
-    check_cuda(cudaMalloc(&ws_->d_refined_doc_lengths, ws_->max_refined_candidates * sizeof(int)));
-    check_cuda(cudaMalloc(&ws_->d_refined_doc_offsets,
-                          (ws_->max_refined_candidates + 1) * sizeof(size_t)));
-
-    check_cuda(cudaMalloc(&d_candidate_bitmap_,
-                          candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t)));
-    check_cuda(cudaMalloc(&d_candidate_bitmap_offsets_,
-                          candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t)));
+    if (ws_->uma_query_buffers) {
+        allocate_ats_buffer(ws_->h_pinned_queries, ws_->d_queries, Q_DOCLEN * PADDED_DIM);
+        allocate_ats_buffer(ws_->h_pinned_cb1_sumq, ws_->d_cb1_sumq, size_t(Q_DOCLEN));
+        allocate_ats_buffer(ws_->h_pinned_refined_doc_offsets, ws_->d_refined_doc_offsets,
+                               ws_->max_refined_candidates + 1);
+        allocate_ats_buffer(ws_->h_candidate_bitmap_offsets, d_candidate_bitmap_offsets_,
+                               candidate_bitmap_offset_count_);
+    } else {
+        check_cuda(cudaMalloc(&ws_->d_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
+        check_cuda(cudaMalloc(&ws_->d_cb1_sumq, Q_DOCLEN * sizeof(float)));
+    }
+    if (ws_->uma_query_buffers) {
+        allocate_ats_buffer(ws_->h_refined_doc_lengths, ws_->d_refined_doc_lengths,
+                            ws_->max_refined_candidates);
+    } else {
+        check_cuda(cudaMalloc(&ws_->d_refined_doc_lengths, ws_->max_refined_candidates * sizeof(int)));
+    }
+    if (!ws_->uma_query_buffers) {
+        check_cuda(cudaMalloc(&ws_->d_refined_doc_offsets,
+                              (ws_->max_refined_candidates + 1) * sizeof(size_t)));
+    }
+    if (options_.uma_cpu_candidates) {
+        allocate_ats_buffer(ws_->h_cpu_candidate_bitmap, d_candidate_bitmap_, candidate_bitmap_bucket_count_);
+        int* alias = nullptr;
+        allocate_ats_buffer(ws_->h_cpu_materialized_ids, alias, max_candidate_docs_);
+        if (options_.uma_cpu_refine) {
+            float* score_alias = nullptr;
+            allocate_ats_buffer(ws_->h_cpu_refine_scores, score_alias, max_candidate_docs_);
+            ws_->cpu_refine_order.resize(max_candidate_docs_);
+        }
+    } else {
+        check_cuda(cudaMalloc(&d_candidate_bitmap_,
+                              candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t)));
+    }
+    if (!ws_->uma_query_buffers) {
+        check_cuda(cudaMalloc(&d_candidate_bitmap_offsets_,
+                              candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t)));
+    }
 
     ws_->d_cub_temp_storage = nullptr;
     ws_->cub_temp_storage_bytes = 0;
@@ -422,39 +480,71 @@ void chimera_index::allocate_workspace() {
         one_bit_token_score_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         document_scoring_lut_smem));
+    if (options_.compact_token_score) {
+        check_cuda(cudaFuncSetAttribute(one_bit_token_score_compact_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, document_scoring_lut_smem));
+    }
+
 
     check_cuda(cudaMalloc(
         &ws_->d_cagra_dists,
         Q_DOCLEN * max_probed_clusters_ * sizeof(float)));
-    check_cuda(cudaMalloc(
-        &ws_->d_cagra_labels,
-        Q_DOCLEN * max_probed_clusters_ * sizeof(uint32_t)));
+    if (options_.uma_cpu_candidates) {
+        allocate_ats_buffer(ws_->h_cpu_cagra_labels, ws_->d_cagra_labels,
+                            Q_DOCLEN * max_probed_clusters_);
+    } else {
+        check_cuda(cudaMalloc(&ws_->d_cagra_labels,
+                             Q_DOCLEN * max_probed_clusters_ * sizeof(uint32_t)));
+    }
 
-    check_cuda(cudaMallocHost(&ws_->h_pinned_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
-    check_cuda(cudaMallocHost(&ws_->h_pinned_cb1_sumq, Q_DOCLEN * sizeof(float)));
+    if (!ws_->uma_query_buffers) {
+        check_cuda(cudaMallocHost(&ws_->h_pinned_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
+        check_cuda(cudaMallocHost(&ws_->h_pinned_cb1_sumq, Q_DOCLEN * sizeof(float)));
+    }
 
     check_cuda(cudaMalloc(&ws_->d_refined_token_positions,
                           ws_->max_refined_tokens * sizeof(uint32_t)));
     check_cuda(cudaMalloc(&ws_->d_one_bit_token_scores,
                           ws_->max_refined_tokens * static_cast<size_t>(Q_DOCLEN) * sizeof(float)));
-    check_cuda(cudaMalloc(&ws_->d_one_bit_document_scores, ws_->max_refined_candidates * sizeof(float)));
+    if (ws_->uma_query_buffers) {
+        allocate_ats_buffer(ws_->h_mapped_one_bit_document_scores,
+                               ws_->d_one_bit_document_scores, ws_->max_refined_candidates);
+        allocate_ats_buffer(ws_->h_refined_doc_ids, ws_->d_mapped_refined_doc_ids,
+                               ws_->max_refined_candidates);
+    } else {
+        check_cuda(cudaMalloc(&ws_->d_one_bit_document_scores, ws_->max_refined_candidates * sizeof(float)));
+        check_cuda(cudaMallocHost(&ws_->h_mapped_one_bit_document_scores,
+                                  ws_->max_refined_candidates * sizeof(float)));
+        check_cuda(cudaMallocHost(&ws_->h_pinned_refined_doc_offsets,
+                                  (ws_->max_refined_candidates + 1) * sizeof(size_t)));
+        check_cuda(cudaMallocHost(&ws_->h_refined_doc_ids,
+                                  ws_->max_refined_candidates * sizeof(int)));
+        check_cuda(cudaMallocHost(&ws_->h_num_refined_tokens, sizeof(size_t)));
+    }
 
-    check_cuda(cudaMallocHost(&ws_->h_mapped_one_bit_document_scores,
+    if (options_.fast_document_reduce && options_.verify_full_bit) {
+        check_cuda(cudaMalloc(&ws_->d_document_reduce_reference,
                               ws_->max_refined_candidates * sizeof(float)));
-    check_cuda(cudaMallocHost(&ws_->h_pinned_refined_doc_offsets,
-                              (ws_->max_refined_candidates + 1) * sizeof(size_t)));
-    check_cuda(cudaMallocHost(&ws_->h_refined_doc_ids,
-                              ws_->max_refined_candidates * sizeof(int)));
-    check_cuda(cudaMallocHost(&ws_->h_num_refined_tokens, sizeof(size_t)));
+        check_cuda(cudaMallocHost(&ws_->h_document_reduce_reference,
+                                  ws_->max_refined_candidates * sizeof(float)));
+    }
 
     if (!skips_candidate_refinement(options_.algorithm_variant)) check_cuda(cudaMemset(
         ws_->d_partial_query_scores,
         0,
         candidate_rows * Q_DOCLEN * sizeof(float)));
-    check_cuda(cudaMemset(d_candidate_bitmap_, 0,
-                          candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t)));
-    check_cuda(cudaMemset(d_candidate_bitmap_offsets_, 0,
-                          candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t)));
+    if (options_.uma_cpu_candidates)
+        std::memset(d_candidate_bitmap_, 0, candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t));
+    else
+        check_cuda(cudaMemset(d_candidate_bitmap_, 0,
+                              candidate_bitmap_bucket_count_ * sizeof(candidate_bitmap_bucket_t)));
+    if (ws_->uma_query_buffers) {
+        std::memset(ws_->h_candidate_bitmap_offsets, 0,
+                    candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t));
+    } else {
+        check_cuda(cudaMemset(d_candidate_bitmap_offsets_, 0,
+                              candidate_bitmap_offset_count_ * sizeof(candidate_bitmap_offset_t)));
+    }
 
     int least_prio, greatest_prio;
     check_cuda(cudaDeviceGetStreamPriorityRange(&least_prio, &greatest_prio));
@@ -523,37 +613,66 @@ void chimera_index::release_resources() noexcept {
     ivf = nullptr;
     cagra_res_.reset();
 
-    (void)cudaFree(d_candidate_bitmap_);
-    (void)cudaFree(d_candidate_bitmap_offsets_);
+    if (ws_ && ws_->h_cpu_candidate_bitmap) std::free(ws_->h_cpu_candidate_bitmap);
+    else (void)cudaFree(d_candidate_bitmap_);
+    if (ws_ && ws_->uma_query_buffers) {
+        std::free(ws_->h_candidate_bitmap_offsets);
+    } else {
+        (void)cudaFree(d_candidate_bitmap_offsets_);
+    }
     (void)cudaFree(d_candidate_arena_raw_);
     if (!batch_owner_) {
     (void)cudaFree(d_doc_ptrs_);
     (void)cudaFree(d_cluster_pos_);
     (void)cudaFree(d_clustered_one_bit_codes_);
     (void)cudaFree(d_clustered_one_bit_factors_);
-    (void)cudaFree(d_clustered_doc_ids_);
+    if (h_uma_clustered_doc_ids_) std::free(h_uma_clustered_doc_ids_);
+    else (void)cudaFree(d_clustered_doc_ids_);
+    h_uma_clustered_doc_ids_ = nullptr;
     (void)cudaFree(d_token_to_cluster_pos_);
     }
 
     if (ws_ != nullptr) {
         release_gpu_full_bit();
-        (void)cudaFree(ws_->d_queries);
-        (void)cudaFree(ws_->d_cb1_sumq);
+        (void)cudaFree(ws_->d_document_reduce_reference);
+        (void)cudaFreeHost(ws_->h_document_reduce_reference);
+        if (!ws_->uma_query_buffers) {
+            (void)cudaFree(ws_->d_queries);
+            (void)cudaFree(ws_->d_cb1_sumq);
+            (void)cudaFree(ws_->d_refined_doc_offsets);
+            (void)cudaFree(ws_->d_one_bit_document_scores);
+        }
         (void)cudaFree(ws_->d_lut);
-        (void)cudaFree(ws_->d_refined_doc_lengths);
+        if (ws_->uma_query_buffers) {
+            std::free(ws_->h_refined_doc_lengths);
+        } else {
+            (void)cudaFree(ws_->d_refined_doc_lengths);
+        }
         (void)cudaFree(ws_->d_cagra_dists);
-        (void)cudaFree(ws_->d_cagra_labels);
+        if (ws_->h_cpu_cagra_labels) std::free(ws_->h_cpu_cagra_labels);
+        else (void)cudaFree(ws_->d_cagra_labels);
+        std::free(ws_->h_cpu_materialized_ids);
+        std::free(ws_->h_cpu_refine_scores);
         (void)cudaFree(ws_->d_cub_temp_storage);
-        (void)cudaFreeHost(ws_->h_pinned_queries);
-        (void)cudaFreeHost(ws_->h_pinned_cb1_sumq);
+        if (ws_->uma_query_buffers) {
+            std::free(ws_->h_pinned_queries);
+            std::free(ws_->h_pinned_cb1_sumq);
+        } else {
+            (void)cudaFreeHost(ws_->h_pinned_queries);
+            (void)cudaFreeHost(ws_->h_pinned_cb1_sumq);
+        }
         (void)cudaFree(ws_->d_one_bit_token_scores);
-        (void)cudaFree(ws_->d_refined_doc_offsets);
         (void)cudaFree(ws_->d_refined_token_positions);
-        (void)cudaFree(ws_->d_one_bit_document_scores);
-        (void)cudaFreeHost(ws_->h_mapped_one_bit_document_scores);
-        (void)cudaFreeHost(ws_->h_pinned_refined_doc_offsets);
-        (void)cudaFreeHost(ws_->h_refined_doc_ids);
-        (void)cudaFreeHost(ws_->h_num_refined_tokens);
+        if (ws_->uma_query_buffers) {
+            std::free(ws_->h_mapped_one_bit_document_scores);
+            std::free(ws_->h_pinned_refined_doc_offsets);
+            std::free(ws_->h_refined_doc_ids);
+        } else {
+            (void)cudaFreeHost(ws_->h_mapped_one_bit_document_scores);
+            (void)cudaFreeHost(ws_->h_pinned_refined_doc_offsets);
+            (void)cudaFreeHost(ws_->h_refined_doc_ids);
+            (void)cudaFreeHost(ws_->h_num_refined_tokens);
+        }
         for (cudaEvent_t event : ws_->chunk_compute_done) {
             if (event != nullptr) (void)cudaEventDestroy(event);
         }
