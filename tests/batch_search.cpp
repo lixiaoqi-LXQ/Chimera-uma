@@ -1,6 +1,8 @@
 #include "chimera/chimera_index.cuh"
 #include "chimera/config.cuh"
+#include "chimera/profiling.hpp"
 #include "chimera/io.hpp"
+#include <cuda_profiler_api.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -63,14 +65,17 @@ static void require_rows(const Ids& rows, size_t count, size_t k) {
 int main(int argc,char** argv) try {
     std::string index_path, query_path, output_path, worker_list="1,2,4,8";
     size_t batch=32, rounds=3, limit=0, k=10;
+    bool batch_only=false, profile_range=false;
     Chimera::SearchOptions options;
     options.nprobe=32; options.k_refine=1000; options.k_full_bit=20;
     options.cagra_itopk_size=64; options.num_chunks=1;
     for(int i=1;i<argc;++i) {
         std::string arg=argv[i];
         if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;continue; }
+        if(arg=="--batch-only") { batch_only=true;continue; }
+        if(arg=="--profile-range") { profile_range=true;continue; }
         if(arg=="--help") {
-            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8 --batch-size 32 --rounds 3 --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit]\n";
+            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8 --batch-size 32 --rounds 3 --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit --batch-only --profile-range]\n";
             return 0;
         }
         if(++i>=argc)throw std::invalid_argument("Missing value for "+arg);
@@ -124,13 +129,17 @@ int main(int argc,char** argv) try {
         <<",\"k_refine\":"<<options.k_refine<<",\"k_full_bit\":"<<options.k_full_bit
         <<",\"cagra_itopk_size\":"<<options.cagra_itopk_size<<",\"chunks\":1"
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
+        <<",\"batch_only\":"<<(batch_only?"true":"false")
+        <<",\"profile_range\":"<<(profile_range?"true":"false")
         <<",\"preflight_queries_per_point\":"<<n
         <<",\"warmup_queries_per_round\":"<<std::min(n,std::max(size_t(32),batch))
         <<",\"timing\":\"host FP32 queries to completed host IDs; QPS from whole query-loop wall time; no encoding/load/warmup/output/recall\""
         <<",\"latency_unit\":\"batch completion ms, B1 per-query ms\",\"points\":[";
     bool first_point=true;
     // workers=0 denotes the original single-query API reference.
-    std::vector<size_t> modes{0}; modes.insert(modes.end(),workers.begin(),workers.end());
+    std::vector<size_t> modes;
+    if(!batch_only)modes.push_back(0);
+    modes.insert(modes.end(),workers.begin(),workers.end());
     for(size_t w:modes) {
         const auto point_start=Clock::now();
         size_t bad_ids=0,bad_scores=0;
@@ -188,8 +197,14 @@ int main(int argc,char** argv) try {
             Chimera::check_cuda(cudaDeviceSynchronize());
             std::vector<double> latencies;
             Ids results(n);
+            if(profile_range) {
+                index.set_profiling_enabled(true);
+                Chimera::check_cuda(cudaProfilerStart(), "Starting timed round capture");
+            }
+            if(profile_range) nvtxRangePushA("ChimeraBatch/measured_round");
             const auto loop_start=Clock::now();
             for(size_t base=0;base<n;base+=(w?batch:1)) {
+                Chimera::ProfileRange call_range(profile_range, w ? "ChimeraBatch/batch" : "ChimeraBatch/B1");
                 const auto call_start=Clock::now();
                 if(w) {
                     const size_t count=std::min(batch,n-base);
@@ -203,6 +218,11 @@ int main(int argc,char** argv) try {
             }
             Chimera::check_cuda(cudaDeviceSynchronize());
             const double wall_ms=elapsed(loop_start);
+            if(profile_range) {
+                nvtxRangePop();
+                Chimera::check_cuda(cudaProfilerStop(), "Stopping timed round capture");
+                index.set_profiling_enabled(false);
+            }
             require_rows(results,n,k);
             const double search_ms=std::accumulate(latencies.begin(),latencies.end(),0.0);
             std::sort(latencies.begin(),latencies.end());

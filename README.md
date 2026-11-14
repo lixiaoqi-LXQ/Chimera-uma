@@ -69,3 +69,10 @@ including query rotation/upload and batch submission overhead. Batch latency
 is measured until the whole batch completes; it is not a single-query latency.
 The output is renamed from `.partial` only after all points finish. Allocation
 failures or GPU errors invalidate the index; reload it before retrying.
+
+For diagnostics, `--batch-only` skips the timed original B1 control while
+retaining initial result checks. `--profile-range` enables NVTX and brackets
+each measured round with CUDA profiler start/stop; use one round when capturing
+with `nsys --capture-range=cudaProfilerApi --capture-range-end=stop`.
+Profiler measurements are diagnostic; throughput results use ordinary runs.
+The report's batch chapter includes B1–B64 curves and the plateau analysis.
