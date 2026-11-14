@@ -54,6 +54,11 @@ struct chimera_index::Workspace {
     cudaStream_t stream_h2d = nullptr;
     cudaStream_t stream_d2h = nullptr;
     cudaEvent_t event_h2d_done = nullptr;
+    // Private to this query workspace/lane. A synchronous search waits for all
+    // active chunk D2H events before returning, so handles can be re-recorded
+    // by the next query without cross-query dependencies.
+    std::vector<cudaEvent_t> chunk_compute_done;
+    std::vector<cudaEvent_t> chunk_d2h_done;
     std::vector<int> one_bit_score_order;
     std::vector<int> full_bit_candidate_indices;
     std::vector<std::pair<float, int>> full_bit_scores;

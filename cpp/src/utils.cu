@@ -463,6 +463,23 @@ void chimera_index::allocate_workspace() {
     check_cuda(cudaStreamCreateWithFlags(&ws_->stream_d2h, cudaStreamNonBlocking));
     check_cuda(cudaEventCreate(&ws_->event_h2d_done));
 
+    // A query can use fewer chunks than requested when candidate count is
+    // small. Reserve the maximum possible count once, including for NoCR.
+    const size_t max_chunks = std::min({
+        static_cast<size_t>(options_.num_chunks),
+        ws_->max_refined_candidates,
+        num_docs});
+    // Initialize every slot before creating handles: release_resources() also
+    // handles a failure halfway through either vector's event creation.
+    ws_->chunk_compute_done.resize(max_chunks, nullptr);
+    ws_->chunk_d2h_done.resize(max_chunks, nullptr);
+    for (size_t chunk = 0; chunk < max_chunks; ++chunk) {
+        check_cuda(cudaEventCreateWithFlags(
+            &ws_->chunk_compute_done[chunk], cudaEventDisableTiming));
+        check_cuda(cudaEventCreateWithFlags(
+            &ws_->chunk_d2h_done[chunk], cudaEventDisableTiming));
+    }
+
 
     ws_->one_bit_score_order.resize(ws_->max_refined_candidates);
     ws_->full_bit_candidate_indices.resize(ws_->max_full_bit_candidates);
@@ -537,6 +554,12 @@ void chimera_index::release_resources() noexcept {
         (void)cudaFreeHost(ws_->h_pinned_refined_doc_offsets);
         (void)cudaFreeHost(ws_->h_refined_doc_ids);
         (void)cudaFreeHost(ws_->h_num_refined_tokens);
+        for (cudaEvent_t event : ws_->chunk_compute_done) {
+            if (event != nullptr) (void)cudaEventDestroy(event);
+        }
+        for (cudaEvent_t event : ws_->chunk_d2h_done) {
+            if (event != nullptr) (void)cudaEventDestroy(event);
+        }
         (void)cudaStreamDestroy(ws_->stream_compute);
         (void)cudaStreamDestroy(ws_->stream_h2d);
         (void)cudaStreamDestroy(ws_->stream_d2h);

@@ -77,3 +77,17 @@ with `nsys --capture-range=cudaProfilerApi --capture-range-end=stop`.
 Profiler measurements are diagnostic; throughput results use ordinary runs.
 The independent batch report at `reports/chimera-batch-search.md` includes
 B1–B64 curves and the plateau analysis.
+
+### Reusable chunk events
+
+Each workspace now owns its chunk compute/D2H completion events. They are
+created during workspace initialization and destroyed during cleanup. Search
+records and waits on these events as before, without creating/destroying CUDA
+event objects per query. Each batch lane has its own event set. This also
+applies to the original CPU full-bit backend and preserves chunk selection,
+scoring, and completion dependencies.
+
+The fixed-B32 full-query comparison and bottleneck evidence are in
+`reports/chimera-batch-search.md`. Auxiliary C2C calibration and CPU memory
+pressure programs are maintained in `systems/chimera/bottleneck/` in the
+research repository.

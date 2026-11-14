@@ -367,13 +367,11 @@ void chimera_index::collaborative_document_scoring(
     const int num_chunks = partition.first;
     const int chunk_size = partition.second;
 
-    std::vector<cudaEvent_t> chunk_compute_done(num_chunks);
-    std::vector<cudaEvent_t> chunk_d2h_done(num_chunks);
-    for (int chunk = 0; chunk < num_chunks; ++chunk) {
-        check_cuda(cudaEventCreateWithFlags(
-            &chunk_compute_done[chunk], cudaEventDisableTiming));
-        check_cuda(cudaEventCreateWithFlags(
-            &chunk_d2h_done[chunk], cudaEventDisableTiming));
+    auto& chunk_compute_done = ws_->chunk_compute_done;
+    auto& chunk_d2h_done = ws_->chunk_d2h_done;
+    if (static_cast<size_t>(num_chunks) > chunk_compute_done.size() ||
+        static_cast<size_t>(num_chunks) > chunk_d2h_done.size()) {
+        throw std::runtime_error("Chunk event workspace capacity exceeded");
     }
 
     auto launch_chunk_compute = [&](int chunk) {
@@ -534,10 +532,6 @@ void chimera_index::collaborative_document_scoring(
 
     for (int doc_id : seen_doc_list) seen_doc_map[doc_id] = false;
 
-    for (int chunk = 0; chunk < num_chunks; ++chunk) {
-        check_cuda(cudaEventDestroy(chunk_compute_done[chunk]));
-        check_cuda(cudaEventDestroy(chunk_d2h_done[chunk]));
-    }
 }
 
 
