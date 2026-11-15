@@ -99,7 +99,7 @@ Use one stage preset in `batch_search_benchmark`:
 
 | Stage | Document reduction | Fullbit scoring | CPU organization |
 |---|---|---|---|
-| `--stage chimera-batch` | Original GPU kernel | Original CPU implementation | Native B1 OpenMP20; batch outer4, serial inner scorer |
+| `--stage chimera-batch` | Original GPU kernel | Original CPU implementation | Native B1 OpenMP20; batch outer4 with inner1 or inner5 |
 | `--stage gpu-rerank` | Original GPU kernel | GPU | Four batch submitters, CPU20 allowed |
 | `--stage uma-collab` | Shared CPU pool | Deferred CPU pool jobs | Four P-core submitters + remaining16-core pool |
 
@@ -108,6 +108,13 @@ query/candidate/refinement buffers and CAGRA ATS placement. They also reject
 individual CPU backend/pool switches. Quality parameters remain caller-controlled.
 Use the same four quality configurations above to compare these stages.
 The main report records native B1 call latency and B32/W4 throughput separately.
+
+The original CPU baseline compares serial inner scoring with four teams of
+five threads. The latter uses `OMP_NUM_THREADS=20,5`,
+`OMP_MAX_ACTIVE_LEVELS=2` and `OMP_THREAD_LIMIT=20`; native B1 still uses20
+threads, and batch has at most20 participating OpenMP threads. LoTTE R10 is
+faster with inner1, while R100 is faster with inner5. The performance driver
+selects the faster measured batch policy and retains B1 from that same case.
 
 ```sh
 # After acquiring the global device lock; hold it through process teardown.
