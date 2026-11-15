@@ -18,6 +18,7 @@
 #include <raft/core/resources.hpp>
 
 #include <filesystem>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
@@ -65,6 +66,39 @@ void chimera_index::validate_search_options(const SearchOptions& options) {
             throw std::invalid_argument("Flat algorithm ablation requires a positive int-sized coarse cluster count");
     } else if (options.expected_coarse_clusters) {
         throw std::invalid_argument("Coarse cluster declaration is only valid for flat algorithm modes");
+    }
+
+    switch (options.cagra_algo) {
+        case CagraSearchAlgorithm::Auto:
+        case CagraSearchAlgorithm::SingleCta:
+        case CagraSearchAlgorithm::MultiCta:
+        case CagraSearchAlgorithm::MultiKernel: break;
+        default: throw std::invalid_argument("Unknown CAGRA search algorithm");
+    }
+    if (options.cagra_team_size != 0 && options.cagra_team_size != 4 &&
+        options.cagra_team_size != 8 && options.cagra_team_size != 16 && options.cagra_team_size != 32)
+        throw std::invalid_argument("CAGRA team size must be 0, 4, 8, 16 or 32");
+    if (options.cagra_thread_block_size != 0 && options.cagra_thread_block_size != 64 &&
+        options.cagra_thread_block_size != 128 && options.cagra_thread_block_size != 256 &&
+        options.cagra_thread_block_size != 512 && options.cagra_thread_block_size != 1024)
+        throw std::invalid_argument("CAGRA block size must be 0, 64, 128, 256, 512 or 1024");
+    if (options.cagra_search_width < 1)
+        throw std::invalid_argument("CAGRA search width must be positive");
+    // cuVS 26.04's actual SINGLE_CTA implementation supports <=512, even
+    // though the shared base validator has a looser <=1024 bound.
+    if (options.cagra_algo == CagraSearchAlgorithm::SingleCta && options.cagra_itopk_size > 512)
+        throw std::invalid_argument("CAGRA SINGLE_CTA requires itopk_size <= 512");
+    // MULTI_KERNEL uses the bundled top-k selector on itopk_size itself.
+    if (options.cagra_algo == CagraSearchAlgorithm::MultiKernel && options.cagra_itopk_size > 1024)
+        throw std::invalid_argument("CAGRA MULTI_KERNEL requires itopk_size <= 1024");
+    if (options.cagra_itopk_size > 0) {
+        const int64_t rounded_itopk = ((int64_t(options.cagra_itopk_size) + 31) / 32) * 32;
+        if ((options.cagra_algo == CagraSearchAlgorithm::SingleCta ||
+             options.cagra_algo == CagraSearchAlgorithm::MultiKernel) && options.nprobe > rounded_itopk)
+            throw std::invalid_argument("CAGRA route output nprobe must not exceed rounded itopk_size");
+        if (options.cagra_algo == CagraSearchAlgorithm::MultiCta &&
+            int64_t(options.nprobe) > 32 * std::max(int64_t(options.cagra_search_width), rounded_itopk / 32))
+            throw std::invalid_argument("CAGRA MULTI_CTA output exceeds CTA result capacity");
     }
 
     if (options.nprobe <= 0 || options.k_refine <= 0 ||

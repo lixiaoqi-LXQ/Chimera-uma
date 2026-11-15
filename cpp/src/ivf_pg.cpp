@@ -156,10 +156,15 @@ void PG_CAGRA::search_centroids(
     float* d_dists,
     uint32_t* d_labels,
     cudaStream_t stream,
-    size_t cagra_itopk_size) {
+    size_t cagra_itopk_size,
+    CagraSearchAlgorithm cagra_algo,
+    size_t cagra_team_size,
+    size_t cagra_thread_block_size,
+    size_t cagra_search_width) {
     search_centroids(
         res_, d_queries, n_queries, nprobe, d_dists, d_labels, stream,
-        cagra_itopk_size);
+        cagra_itopk_size, cagra_algo, cagra_team_size,
+        cagra_thread_block_size, cagra_search_width);
 }
 
 void PG_CAGRA::search_centroids(
@@ -170,7 +175,11 @@ void PG_CAGRA::search_centroids(
     float* d_dists,
     uint32_t* d_labels,
     cudaStream_t stream,
-    size_t cagra_itopk_size) {
+    size_t cagra_itopk_size,
+    CagraSearchAlgorithm cagra_algo,
+    size_t cagra_team_size,
+    size_t cagra_thread_block_size,
+    size_t cagra_search_width) {
     raft::resource::set_cuda_stream(res, rmm::cuda_stream_view(stream));
 
     auto queries = raft::make_device_matrix_view(
@@ -188,6 +197,16 @@ void PG_CAGRA::search_centroids(
 
     cuvs::neighbors::cagra::search_params search_params;
     search_params.itopk_size = cagra_itopk_size;
+    switch (cagra_algo) {
+        case CagraSearchAlgorithm::Auto: search_params.algo = cuvs::neighbors::cagra::search_algo::AUTO; break;
+        case CagraSearchAlgorithm::SingleCta: search_params.algo = cuvs::neighbors::cagra::search_algo::SINGLE_CTA; break;
+        case CagraSearchAlgorithm::MultiCta: search_params.algo = cuvs::neighbors::cagra::search_algo::MULTI_CTA; break;
+        case CagraSearchAlgorithm::MultiKernel: search_params.algo = cuvs::neighbors::cagra::search_algo::MULTI_KERNEL; break;
+        default: throw std::invalid_argument("Unknown CAGRA search algorithm");
+    }
+    search_params.team_size = cagra_team_size;
+    search_params.thread_block_size = cagra_thread_block_size;
+    search_params.search_width = cagra_search_width;
     cuvs::neighbors::cagra::search(
         res, search_params, *index_cagra, queries, labels, distances);
 }
@@ -220,10 +239,15 @@ void IVF_PG::search_centroids(
     float* d_dists,
     uint32_t* d_labels,
     cudaStream_t stream,
-    size_t cagra_itopk_size) {
+    size_t cagra_itopk_size,
+    CagraSearchAlgorithm cagra_algo,
+    size_t cagra_team_size,
+    size_t cagra_thread_block_size,
+    size_t cagra_search_width) {
     pg_index->search_centroids(
         d_queries, n_queries, nprobe, d_dists, d_labels, stream,
-        cagra_itopk_size);
+        cagra_itopk_size, cagra_algo, cagra_team_size,
+        cagra_thread_block_size, cagra_search_width);
 }
 
 void IVF_PG::search_centroids(
@@ -234,10 +258,15 @@ void IVF_PG::search_centroids(
     float* d_dists,
     uint32_t* d_labels,
     cudaStream_t stream,
-    size_t cagra_itopk_size) {
+    size_t cagra_itopk_size,
+    CagraSearchAlgorithm cagra_algo,
+    size_t cagra_team_size,
+    size_t cagra_thread_block_size,
+    size_t cagra_search_width) {
     pg_index->search_centroids(
         res, d_queries, n_queries, nprobe, d_dists, d_labels, stream,
-        cagra_itopk_size);
+        cagra_itopk_size, cagra_algo, cagra_team_size,
+        cagra_thread_block_size, cagra_search_width);
 }
 
 void IVF_PG::build_from_assignments(const uint32_t* list_nos, size_t n_vectors) {

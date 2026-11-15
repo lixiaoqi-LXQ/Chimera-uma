@@ -1,5 +1,7 @@
 #pragma once
 
+#include "chimera/chimera_index.cuh"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -40,7 +42,11 @@ struct PG_CAGRA {
         float* d_dists,
         uint32_t* d_labels,
         cudaStream_t stream,
-        size_t cagra_itopk_size = 150);
+        size_t cagra_itopk_size = 150,
+        CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
+        size_t cagra_team_size = 0,
+        size_t cagra_thread_block_size = 0,
+        size_t cagra_search_width = 1);
     void search_centroids(
         const raft::resources& res,
         const float* d_queries,
@@ -49,7 +55,11 @@ struct PG_CAGRA {
         float* d_dists,
         uint32_t* d_labels,
         cudaStream_t stream,
-        size_t cagra_itopk_size = 150);
+        size_t cagra_itopk_size = 150,
+        CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
+        size_t cagra_team_size = 0,
+        size_t cagra_thread_block_size = 0,
+        size_t cagra_search_width = 1);
     void save(const std::string& graph_path) const;
     void load(const std::string& graph_path);
 };
@@ -72,7 +82,11 @@ struct IVF_PG {
         float* d_dists,
         uint32_t* d_labels,
         cudaStream_t stream,
-        size_t cagra_itopk_size = 150);
+        size_t cagra_itopk_size = 150,
+        CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
+        size_t cagra_team_size = 0,
+        size_t cagra_thread_block_size = 0,
+        size_t cagra_search_width = 1);
     void search_centroids(
         const raft::resources& res,
         const float* d_queries,
@@ -81,7 +95,11 @@ struct IVF_PG {
         float* d_dists,
         uint32_t* d_labels,
         cudaStream_t stream,
-        size_t cagra_itopk_size = 150);
+        size_t cagra_itopk_size = 150,
+        CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
+        size_t cagra_team_size = 0,
+        size_t cagra_thread_block_size = 0,
+        size_t cagra_search_width = 1);
 
     void build_from_assignments(const uint32_t* list_nos, size_t n_vectors);
     int max_cluster_size() const;

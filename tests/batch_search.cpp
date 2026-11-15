@@ -78,7 +78,7 @@ int main(int argc,char** argv) try {
     std::string index_path, query_path, output_path, worker_list="1,2,4,8";
     size_t batch=32, rounds=3, limit=0, k=10, query_repeats=1;
     bool batch_only=false, profile_range=false;
-    std::string cagra_memory="device";
+    std::string cagra_memory="device", cagra_algo="auto";
     std::string stage_name="custom";
     bool custom_backend_switch=false, explicit_workers=false;
     Chimera::SearchOptions options;
@@ -106,6 +106,8 @@ int main(int argc,char** argv) try {
                 << "    uma-collab:   CPU document reduction + deferred CPU fullbit, 16-worker pool\n"
                 << "  [--workers 4 --batch-size 32 --rounds 4 --query-repeats 1]\n"
                 << "  [--topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64]\n"
+                << "  [--cagra-algo auto|single-cta|multi-cta|multi-kernel]\n"
+                << "  [--cagra-team-size 0|4|8|16|32 --cagra-thread-block-size 0|64|128|256|512|1024 --cagra-search-width N]\n"
                 << "  [--verify-full-bit --limit N --batch-only --profile-range]\n"
                 << "Native B1 and batch are both measured unless --batch-only is selected.\n"
                 << "Named stages exclude archived GPU-kernel and UMA-buffer experiments.\n"
@@ -119,6 +121,17 @@ int main(int argc,char** argv) try {
         else if(arg=="--output")output_path=value;
         else if(arg=="--workers") { worker_list=value;explicit_workers=true; }
         else if(arg=="--stage")stage_name=value;
+        else if(arg=="--cagra-algo") {
+            cagra_algo=value;
+            if(value=="auto") options.cagra_algo=Chimera::CagraSearchAlgorithm::Auto;
+            else if(value=="single-cta") options.cagra_algo=Chimera::CagraSearchAlgorithm::SingleCta;
+            else if(value=="multi-cta") options.cagra_algo=Chimera::CagraSearchAlgorithm::MultiCta;
+            else if(value=="multi-kernel") options.cagra_algo=Chimera::CagraSearchAlgorithm::MultiKernel;
+            else throw std::invalid_argument("Unknown CAGRA algorithm");
+        }
+        else if(arg=="--cagra-team-size") options.cagra_team_size=std::stoi(value);
+        else if(arg=="--cagra-thread-block-size") options.cagra_thread_block_size=std::stoi(value);
+        else if(arg=="--cagra-search-width") options.cagra_search_width=std::stoi(value);
         else if(arg=="--cagra-memory") {
             cagra_memory=value;
             if(value=="device") options.cagra_memory_placement=Chimera::CagraMemoryPlacement::Device;
@@ -193,6 +206,10 @@ int main(int argc,char** argv) try {
         <<",\"rounds\":"<<rounds<<",\"nprobe\":"<<options.nprobe
         <<",\"k_refine\":"<<options.k_refine<<",\"k_full_bit\":"<<options.k_full_bit
         <<",\"cagra_itopk_size\":"<<options.cagra_itopk_size<<",\"chunks\":1"
+        <<",\"cagra_algo\":\""<<cagra_algo<<"\""
+        <<",\"cagra_team_size\":"<<options.cagra_team_size
+        <<",\"cagra_thread_block_size\":"<<options.cagra_thread_block_size
+        <<",\"cagra_search_width\":"<<options.cagra_search_width
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
         <<",\"compact_token_score\":"<<(options.compact_token_score?"true":"false")
         <<",\"fast_document_reduce\":"<<(options.fast_document_reduce?"true":"false")

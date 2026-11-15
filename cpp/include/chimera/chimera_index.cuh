@@ -67,6 +67,8 @@ inline bool skips_candidate_refinement(AlgorithmVariant v) { return v == Algorit
 inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == AlgorithmVariant::NoIVFPG || v == AlgorithmVariant::Neither; }
 
 enum class CagraMemoryPlacement { Device, AtsDataset, AtsDatasetAndGraph };
+// Existing cuVS search implementations; this only controls host dispatch.
+enum class CagraSearchAlgorithm { Auto = 100, SingleCta = 0, MultiCta = 1, MultiKernel = 2 };
 
 struct SearchOptions {
     AlgorithmVariant algorithm_variant = AlgorithmVariant::Full;
@@ -76,6 +78,10 @@ struct SearchOptions {
     int k_refine = 3000;
     int k_full_bit = 300;
     int cagra_itopk_size = 150;
+    CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto;
+    int cagra_team_size = 0;
+    int cagra_thread_block_size = 0;
+    int cagra_search_width = 1;
     int num_chunks = 5;
     bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.

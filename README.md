@@ -156,3 +156,13 @@ remain opt-in under `--stage custom` for compatibility; all are disabled in
 the three named stages. Their gains are kept outside the UMA collaboration
 comparison. The research repository tracks the snapshot in
 `configs/performance-stages.json`.
+
+### Optional CAGRA search parameters
+
+`batch_search_benchmark` exposes the installed cuVS search implementations with
+`--cagra-algo auto|single-cta|multi-cta|multi-kernel`, `--cagra-team-size`,
+`--cagra-thread-block-size`, and `--cagra-search-width`. Their defaults are
+`auto`, `0`, `0`, and `1`, matching the original route. These settings apply
+equally to the three named stages through `SearchOptions`; the original
+Chimera scoring kernels remain unchanged. Routing parameter gains are reported
+separately from CPU cooperation, with recall checked on the complete query set.
