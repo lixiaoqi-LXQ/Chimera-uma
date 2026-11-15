@@ -38,8 +38,13 @@ namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
     if (options.shared_onebit_base_pages &&
-        !options.shared_onebit_corpus && !options.uma_cpu_onebit_fused)
+        !options.shared_onebit_corpus && !options.uma_cpu_onebit_fused && !options.uma_cpu_onebit_half)
         throw std::invalid_argument("Shared onebit base-page control requires shared corpus or CPU onebit fused");
+    if (options.uma_cpu_onebit_half && (options.num_chunks != 1 || options.uma_cpu_onebit_fused ||
+        options.uma_cpu_document || options.uma_cpu_fullbit_deferred || options.uma_cpu_fullbit_fraction != 0 ||
+        options.compact_token_score || options.fast_document_reduce || options.uma_query_buffers ||
+        options.uma_cpu_candidates || options.uma_cpu_refine || !options.gpu_full_bit))
+        throw std::invalid_argument("CPU onebit half requires chunks=1, original GPU scoring and all other CPU modules/small buffers off");
     if (options.uma_cpu_onebit_fused && (options.num_chunks != 1 || options.uma_cpu_document ||
         options.compact_token_score || options.fast_document_reduce || options.uma_query_buffers ||
         options.uma_cpu_candidates || options.uma_cpu_refine))
@@ -416,7 +421,7 @@ void chimera_index::initialize_search_state() {
                               n * sizeof(uint32_t), cudaMemcpyHostToDevice));
     }
 
-    if (options_.shared_onebit_corpus || options_.uma_cpu_onebit_fused) {
+    if (options_.shared_onebit_corpus || options_.uma_cpu_onebit_fused || options_.uma_cpu_onebit_half) {
         int device=0, pageable=0, host_tables=0;
         check_cuda(cudaGetDevice(&device));
         check_cuda(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device));
@@ -500,7 +505,7 @@ void chimera_index::initialize_search_state() {
               << " token_score_bytes=" << ws_->max_refined_tokens * size_t(Q_DOCLEN) * sizeof(float)
               << " CR_arena=" << (skips_candidate_refinement(options_.algorithm_variant) ? "absent" : "original")
               << " flat_scratch_bytes=" << (ws_->flat_router ? ws_->flat_router->scratch_bytes() : 0) << '\n';
-    if (!batch_owner_ && (options_.uma_cpu_fullbit_fraction > 0 || options_.uma_cpu_document || options_.uma_cpu_onebit_fused)) {
+    if (!batch_owner_ && (options_.uma_cpu_fullbit_fraction > 0 || options_.uma_cpu_document || options_.uma_cpu_onebit_fused || options_.uma_cpu_onebit_half)) {
         cpu_task_pool_ = std::make_shared<CpuTaskPool>(options_.uma_cpu_threads,
             CpuTaskPool::parse_cpu_list(options_.uma_cpu_pool_cpus));
         std::cout << "[CPU_POOL] workers=" << options_.uma_cpu_threads

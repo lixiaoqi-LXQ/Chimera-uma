@@ -549,7 +549,7 @@ void chimera_index::allocate_workspace() {
         check_cuda(cudaMallocHost(&ws_->h_num_refined_tokens, sizeof(size_t)));
     }
 
-    if ((options_.fast_document_reduce || ws_->cpu_document_enabled || options_.uma_cpu_onebit_fused) && options_.verify_full_bit) {
+    if ((options_.fast_document_reduce || ws_->cpu_document_enabled || options_.uma_cpu_onebit_fused || options_.uma_cpu_onebit_half) && options_.verify_full_bit) {
         check_cuda(cudaMalloc(&ws_->d_document_reduce_reference,
                               ws_->max_refined_candidates * sizeof(float)));
         check_cuda(cudaMallocHost(&ws_->h_document_reduce_reference,

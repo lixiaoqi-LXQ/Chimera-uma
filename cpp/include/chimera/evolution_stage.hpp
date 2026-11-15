@@ -20,7 +20,7 @@ inline EvolutionStage parse_evolution_stage(const std::string& name) {
 // the execution backend and excludes the archived kernel/metadata experiments.
 inline void apply_evolution_stage(EvolutionStage stage, SearchOptions& options) {
     if (stage == EvolutionStage::Custom) return;
-    if (options.shared_onebit_corpus || options.uma_cpu_onebit_fused)
+    if (options.shared_onebit_corpus || options.uma_cpu_onebit_fused || options.uma_cpu_onebit_half)
         throw std::invalid_argument("Shared onebit experiments require the custom stage");
     if (options.compact_token_score || options.fast_document_reduce ||
         options.uma_query_buffers || options.uma_cpu_candidates || options.uma_cpu_refine ||

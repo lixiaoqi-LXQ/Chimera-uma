@@ -92,6 +92,7 @@ int main(int argc,char** argv) try {
         if(arg=="--uma-cpu-refine") { options.uma_cpu_refine=true; options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
         if(arg=="--uma-cpu-candidates") { options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
         if(arg=="--uma-query-buffers") { options.uma_query_buffers=true;continue; }
+        if(arg=="--uma-cpu-onebit-half") { options.uma_cpu_onebit_half=true;options.shared_onebit_corpus=true;custom_backend_switch=true;continue; }
         if(arg=="--shared-onebit-corpus") { options.shared_onebit_corpus=true;custom_backend_switch=true;continue; }
         if(arg=="--shared-onebit-base-pages") { options.shared_onebit_base_pages=true;custom_backend_switch=true;continue; }
         if(arg=="--uma-cpu-onebit-fused") { options.uma_cpu_onebit_fused=true;options.shared_onebit_corpus=true;custom_backend_switch=true;continue; }
@@ -107,7 +108,7 @@ int main(int argc,char** argv) try {
                 << "    chimera-batch: original CPU fullbit + batch adaptation\n"
                 << "    gpu-rerank:   move fullbit to GPU, original 1bit kernels\n"
                 << "    uma-collab:   CPU document reduction + deferred CPU fullbit, 16-worker pool\n"
-                << "  [--shared-onebit-corpus | --uma-cpu-onebit-fused] (custom stage, chunks=1)\n"
+                << "  [--shared-onebit-corpus | --uma-cpu-onebit-fused | --uma-cpu-onebit-half] (custom stage, chunks=1)\n"
                 << "  [--shared-onebit-base-pages] (requires shared corpus or fused; MADV_NOHUGEPAGE)\n"
                 << "  [--workers 4 --batch-size 32 --rounds 4 --query-repeats 1]\n"
                 << "  [--topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64]\n"
@@ -226,6 +227,7 @@ int main(int argc,char** argv) try {
         <<",\"uma_cpu_fullbit_deferred\":"<<(options.uma_cpu_fullbit_deferred?"true":"false")
         <<",\"shared_onebit_corpus\":"<<(options.shared_onebit_corpus?"true":"false")
         <<",\"shared_onebit_base_pages\":"<<(options.shared_onebit_base_pages?"true":"false")
+        <<",\"uma_cpu_onebit_half\":"<<(options.uma_cpu_onebit_half?"true":"false")
         <<",\"uma_cpu_onebit_fused\":"<<(options.uma_cpu_onebit_fused?"true":"false")
         <<",\"uma_cpu_document\":"<<(options.uma_cpu_document?"true":"false")
         <<",\"uma_cpu_threads\":"<<options.uma_cpu_threads

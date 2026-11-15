@@ -94,6 +94,7 @@ struct SearchOptions {
     bool uma_cpu_fullbit_deferred = false;  // Batch-only detached fullbit tails; fraction=1, chunks=1.
     bool shared_onebit_corpus = false;  // Placement-only control: GPU and CPU share ATS codes/factors/inverse.
     bool shared_onebit_base_pages = false;  // Diagnostic: same ATS allocation with MADV_NOHUGEPAGE.
+    bool uma_cpu_onebit_half = false;  // CPU first floor(R/2) docs, original GPU suffix; custom stage.
     bool uma_cpu_onebit_fused = false;  // Implies shared corpus; CPU token+document scoring, chunks=1.
     bool uma_cpu_document = false;  // Shared CPU pool reduces GPU token scores to document scores.
     int uma_cpu_threads = 10;
