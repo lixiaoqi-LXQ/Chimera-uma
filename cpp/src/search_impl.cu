@@ -541,6 +541,15 @@ void chimera_index::collaborative_document_scoring(
     // UMA metadata is already CPU-ready. gather_refined_token_positions stays
     // queued before scoring in the same compute stream; no extra host wait.
     const int* refined_doc_ids = ws_->h_refined_doc_ids;
+    if (profiling_enabled_ && profile_query_id_ >= 0) {
+        profile_refined_docs_ = size_t(num_refined_candidates);
+        // The ordinary metadata handoff already provides the exact scan total.
+        // Observe it in O(1), without adding a random doc-pointer walk before
+        // the GPU token launch or an additional CUDA wait.
+        profile_refined_tokens_ = total_tokens;
+        if (ws_->h_pinned_refined_doc_offsets[num_refined_candidates] != total_tokens)
+            throw std::runtime_error("Profile refined token count disagrees with actual document offsets");
+    }
 
     // Score the chunks on the GPU while completed chunks stream to the CPU.
     int score_threads = 128;
@@ -685,14 +694,19 @@ void chimera_index::collaborative_document_scoring(
 
         if (ws_->cpu_document_enabled && chunk_count > 0) {
             if (!cpu_task_pool_) throw std::runtime_error("CPU document worker pool is unavailable");
-            ProfileRange cpu_reduce(profiling_enabled_, "Chimera/cpu_document_pool_reduce", chunk);
+            const bool qid_profile = profiling_enabled_ && profile_query_id_ >= 0;
+            const int64_t qid = profile_query_id_;
+            ProfileRange cpu_reduce(profiling_enabled_, "Chimera/cpu_document_pool_reduce",
+                                    qid_profile ? qid : int64_t(chunk));
             constexpr size_t docs_per_tile = 32;
             const size_t tile_count = (static_cast<size_t>(chunk_count) + docs_per_tile - 1) / docs_per_tile;
+            if (qid_profile) profile_document_tiles_ += tile_count;
             const float* scores = ws_->h_cpu_document_token_scores;
             const size_t* offsets = ws_->h_pinned_refined_doc_offsets;
             float* outputs = ws_->h_mapped_one_bit_document_scores;
             auto group = cpu_task_pool_->submit(tile_count, 1,
-                [scores, offsets, outputs, total_tokens, chunk_start, chunk_end](size_t tile) {
+                [scores, offsets, outputs, total_tokens, chunk_start, chunk_end, qid_profile, qid](size_t tile) {
+                    ProfileRange work(qid_profile, "Chimera/cpu_document_worker", qid);
                     const size_t first = static_cast<size_t>(chunk_start) + tile * size_t(32);
                     const size_t count = std::min(size_t(32), static_cast<size_t>(chunk_end) - first);
                     score_one_bit_documents_cpu_pool(scores, offsets + first,
@@ -773,12 +787,23 @@ void chimera_index::collaborative_document_scoring(
 
         }
 
+        if (profiling_enabled_ && profile_query_id_ >= 0) {
+            profile_fullbit_candidates_ += size_t(num_full_bit_candidates);
+            const auto& ptrs = corpus().doc_ptrs_;
+            for (int i = 0; i < num_full_bit_candidates; ++i) {
+                const int doc = refined_doc_ids[full_bit_candidate_indices[i]];
+                profile_fullbit_tokens_ += size_t(ptrs[doc + 1] - ptrs[doc]);
+            }
+        }
+
         if (defer_fullbit_in_batch_) {
             if (num_chunks != 1 || options_.uma_cpu_fullbit_fraction != 1.0 || pending_fullbit_)
                 throw std::logic_error("Invalid deferred fullbit batch state");
             // Copy every per-query input before releasing this workspace.
             // The factory also captures GPU verification while d_queries is
             // still the current query, then submits independent CPU work.
+            if (profiling_enabled_ && profile_query_id_ >= 0)
+                profile_fullbit_tasks_ += size_t(num_full_bit_candidates);
             pending_fullbit_ = submit_deferred_fullbit(
                 refined_doc_ids, full_bit_candidate_indices.data(),
                 num_full_bit_candidates, ws_->h_pinned_queries, queries);

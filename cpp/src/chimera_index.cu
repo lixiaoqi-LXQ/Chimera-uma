@@ -7,6 +7,7 @@
 
 #include "chimera/config.cuh"
 #include "chimera/io.hpp"
+#include "chimera/profiling.hpp"
 #include "chimera/index_file_io.hpp"
 #include "chimera/ivf_pg.hpp"
 #include "chimera/quantization.hpp"
@@ -487,6 +488,13 @@ std::vector<std::vector<size_t>> chimera_index::search_batch(
         throw std::invalid_argument("Batch workers must be in [1, 20]");
     const size_t count = query_values / stride;
     last_batch_result_scores_.clear();
+    const bool query_profile = profiling_enabled_ && profile_query_base_ >= 0;
+    if (query_profile && count && uint64_t(count - 1) >
+            uint64_t(std::numeric_limits<int64_t>::max() - profile_query_base_))
+        throw std::overflow_error("Profile query ID overflow");
+    if (query_profile && (uint64_t(profile_query_base_) > last_batch_profile_stats_.size() ||
+            count > last_batch_profile_stats_.size() - size_t(profile_query_base_)))
+        throw std::invalid_argument("Prepare profile query stats before capture");
     if (!count) return {};
     workers = std::min(workers, count);
     prepare_batch(workers);
@@ -513,7 +521,30 @@ std::vector<std::vector<size_t>> chimera_index::search_batch(
             check_cuda(cudaSetDevice(device));
             for (size_t q = lane; q < count; q += workers) {
                 active_query = q;
-                results[q] = worker.search_one(queries + q * stride, k);
+                worker.profile_query_id_ = query_profile ? profile_query_base_ + int64_t(q) : -1;
+                if (query_profile) {
+                    worker.profile_document_tiles_ = 0;
+                    worker.profile_fullbit_tasks_ = 0;
+                    worker.profile_refined_docs_ = 0;
+                    worker.profile_refined_tokens_ = 0;
+                    worker.profile_fullbit_candidates_ = 0;
+                    worker.profile_fullbit_tokens_ = 0;
+                }
+                ProfileRange query_range(query_profile, "Chimera/query", worker.profile_query_id_);
+                if (worker.options_.verify_full_bit) {
+                    try { results[q] = worker.search_one(queries + q * stride, k); }
+                    catch (const std::exception& error) {
+                        throw std::runtime_error("Candidate verification query_in_batch=" +
+                            std::to_string(q) + " lane=" + std::to_string(lane) + ": " + error.what());
+                    }
+                } else {
+                    results[q] = worker.search_one(queries + q * stride, k);
+                }
+                if (query_profile) last_batch_profile_stats_[size_t(profile_query_base_) + q] = QueryProfileStats{
+                    worker.profile_query_id_, size_t(lane), q / workers,
+                    worker.profile_document_tiles_, worker.profile_fullbit_tasks_,
+                    worker.profile_refined_docs_, worker.profile_refined_tokens_,
+                    worker.profile_fullbit_candidates_, worker.profile_fullbit_tokens_};
                 if (deferred && worker.pending_fullbit_) {
                     // The job owns its query/IDs/scores. This lane can reuse
                     // its workspace immediately for the next GPU front end.
@@ -530,6 +561,7 @@ std::vector<std::vector<size_t>> chimera_index::search_batch(
             errors[lane] = std::current_exception();
         }
         worker.defer_fullbit_in_batch_ = false;
+        worker.profile_query_id_ = -1;
     }
     std::exception_ptr failure;
     for (const auto& error : errors) {

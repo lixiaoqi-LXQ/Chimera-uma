@@ -100,6 +100,19 @@ inline void check_cuda(
     }
 }
 
+// Optional per-query diagnostic counters; allocated only for explicit qid profiling.
+struct QueryProfileStats {
+    int64_t qid = -1;
+    size_t lane = 0;
+    size_t lane_ordinal = 0;
+    size_t expected_document_tiles = 0;
+    size_t expected_fullbit_tasks = 0;
+    size_t refined_docs = 0;
+    size_t refined_tokens = 0;
+    size_t fullbit_candidates = 0;
+    size_t fullbit_tokens = 0;
+};
+
 class chimera_index {
   public:
     chimera_index();
@@ -188,6 +201,24 @@ class chimera_index {
 
     // Optional observation only; disabled for original API callers.
     void set_profiling_enabled(bool enabled) { profiling_enabled_ = enabled; }
+    // Set >=0 before each profiled batch; -1 preserves existing profiling payloads.
+    void set_profile_query_base(int64_t base) {
+        if (base < -1) throw std::invalid_argument("Profile query base must be >= -1");
+        profile_query_base_ = base;
+    }
+    // Allocate once outside capture; qid is also its bounds-checked output slot.
+    void prepare_profile_query_stats(size_t count) {
+        last_batch_profile_stats_.assign(count, QueryProfileStats{});
+    }
+    const std::vector<QueryProfileStats>& last_batch_profile_stats() const {
+        return last_batch_profile_stats_;
+    }
+    // Diagnostic only; call between synchronous searches, after loading with
+    // verify_full_bit=true so every lane has its verification scratch storage.
+    void disable_diagnostic_candidate_verification() {
+        options_.verify_full_bit = false;
+        for (auto& worker : batch_workers_) worker->options_.verify_full_bit = false;
+    }
     void set_capture_scores(bool enabled) { capture_scores_ = enabled; }
     const std::vector<float>& last_result_scores() const { return last_result_scores_; }
 
@@ -289,6 +320,15 @@ class chimera_index {
     const chimera_index& corpus() const { return batch_owner_ ? *batch_owner_ : *this; }
 
     bool profiling_enabled_ = false;
+    int64_t profile_query_base_ = -1;
+    int64_t profile_query_id_ = -1;  // Lane-local current query; never shared across lanes.
+    size_t profile_document_tiles_ = 0;
+    size_t profile_fullbit_tasks_ = 0;
+    size_t profile_refined_docs_ = 0;
+    size_t profile_refined_tokens_ = 0;
+    size_t profile_fullbit_candidates_ = 0;
+    size_t profile_fullbit_tokens_ = 0;
+    std::vector<QueryProfileStats> last_batch_profile_stats_;
     bool capture_scores_ = false;
     std::vector<float> last_result_scores_;
 

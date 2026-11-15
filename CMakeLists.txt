@@ -175,3 +175,8 @@ set_target_properties(token_score_qualification PROPERTIES CUDA_SEPARABLE_COMPIL
 add_executable(cpu_pool_qualification tests/cpu_pool.cpp)
 target_include_directories(cpu_pool_qualification PRIVATE cpp/src)
 target_link_libraries(cpu_pool_qualification PRIVATE OpenMP::OpenMP_CXX)
+
+# Small-sample per-query phase diagnostics, separate from formal QPS.
+add_executable(chimera_phase_sampling tests/phase_sampling.cpp)
+target_link_libraries(chimera_phase_sampling PRIVATE chimera_core)
+set_target_properties(chimera_phase_sampling PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

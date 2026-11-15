@@ -28,6 +28,7 @@ struct alignas(64) chimera_index::PendingFullbit {
     std::vector<std::pair<float, int>> gpu_reference;
     std::shared_ptr<CpuTaskPool::Group> group;
     bool profile = false;
+    int64_t qid = -1;
 
     ~PendingFullbit() noexcept {
         // Protect owned input storage on every exception/unwinding path too.
@@ -41,11 +42,13 @@ struct alignas(64) chimera_index::PendingFullbit {
 std::shared_ptr<chimera_index::PendingFullbit> chimera_index::submit_deferred_fullbit(
     const int* refined_doc_ids, const int* candidate_indices, int count,
     const float* queries_flat, const QueryState* queries) {
-    ProfileRange submit(profiling_enabled_, "Chimera/deferred_fullbit_submit", count);
+    ProfileRange submit(profiling_enabled_, "Chimera/deferred_fullbit_submit",
+                        profile_query_id_ >= 0 ? profile_query_id_ : int64_t(count));
     if (!cpu_task_pool_ || count <= 0)
         throw std::logic_error("Deferred fullbit requires a pool and nonempty candidates");
     auto job = std::make_shared<PendingFullbit>();
     job->profile = profiling_enabled_;
+    job->qid = profile_query_id_;
     std::copy_n(queries_flat, Q_DOCLEN * PADDED_DIM, job->rotated_query.data());
     for (size_t q = 0; q < Q_DOCLEN; ++q) job->cbex_sumq[q] = queries[q].cbex_sumq;
     job->doc_ids.resize(count);
@@ -76,7 +79,8 @@ std::shared_ptr<chimera_index::PendingFullbit> chimera_index::submit_deferred_fu
         [input, output](size_t index) {
             const int doc = output->doc_ids[index];
             ProfileRange work(output->profile, "Chimera/deferred_fullbit_worker",
-                              input.doc_ptrs[doc + 1] - input.doc_ptrs[doc]);
+                              output->qid >= 0 ? output->qid :
+                                  int64_t(input.doc_ptrs[doc + 1] - input.doc_ptrs[doc]));
             output->scores[index] = score_fullbit_document_cpu(input, doc);
         });
     return job;
@@ -84,7 +88,8 @@ std::shared_ptr<chimera_index::PendingFullbit> chimera_index::submit_deferred_fu
 
 void chimera_index::wait_deferred_fullbit(const std::shared_ptr<PendingFullbit>& job) {
     if (!job) return;
-    ProfileRange join(job->profile, "Chimera/deferred_fullbit_join", job->doc_ids.size());
+    ProfileRange join(job->profile, "Chimera/deferred_fullbit_join",
+                      job->qid >= 0 ? job->qid : int64_t(job->doc_ids.size()));
     job->group->wait();
 }
 
@@ -92,7 +97,8 @@ void chimera_index::finish_deferred_fullbit(
     const std::shared_ptr<PendingFullbit>& job, size_t k,
     std::vector<size_t>& result, std::vector<float>* captured_scores) {
     wait_deferred_fullbit(job);
-    ProfileRange finish(job->profile, "Chimera/deferred_fullbit_finish", job->scores.size());
+    ProfileRange finish(job->profile, "Chimera/deferred_fullbit_finish",
+                        job->qid >= 0 ? job->qid : int64_t(job->scores.size()));
     if (!job->gpu_reference.empty()) {
         for (size_t i = 0; i < job->scores.size(); ++i) {
             const auto& actual = job->scores[i];
