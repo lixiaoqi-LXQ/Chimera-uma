@@ -89,11 +89,13 @@ int main(int argc,char** argv) try {
         if(arg=="--uma-cpu-refine") { options.uma_cpu_refine=true; options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
         if(arg=="--uma-cpu-candidates") { options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
         if(arg=="--uma-query-buffers") { options.uma_query_buffers=true;continue; }
+        if(arg=="--uma-cpu-document") { options.uma_cpu_document=true;continue; }
+        if(arg=="--uma-cpu-fullbit-deferred") { options.uma_cpu_fullbit_deferred=true; options.uma_cpu_fullbit_fraction=1.0;continue; }
         if(arg=="--verify-full-bit") { options.verify_full_bit=true;continue; }
         if(arg=="--batch-only") { batch_only=true;continue; }
         if(arg=="--profile-range") { profile_range=true;continue; }
         if(arg=="--help") {
-            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8,10 --batch-size 32 --rounds 3 --query-repeats 1 --compact-token-score --fast-document-reduce --uma-query-buffers --uma-cpu-candidates --uma-cpu-refine --cagra-memory device|ats-dataset|ats-both --verify-full-bit --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit --batch-only --profile-range]\n";
+            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8,10 --batch-size 32 --rounds 3 --query-repeats 1 --compact-token-score --fast-document-reduce --uma-query-buffers --uma-cpu-candidates --uma-cpu-refine --uma-cpu-document --uma-cpu-fullbit-deferred --uma-cpu-fullbit-fraction 0.25 --uma-cpu-threads 10 --uma-cpu-pool-cpus 0,10,1,11,2,12,3,13,4,14 --cagra-memory device|ats-dataset|ats-both --verify-full-bit --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit --batch-only --profile-range]\n";
             return 0;
         }
         if(++i>=argc)throw std::invalid_argument("Missing value for "+arg);
@@ -118,6 +120,9 @@ int main(int argc,char** argv) try {
         else if(arg=="--k-refine")options.k_refine=std::stoi(value);
         else if(arg=="--k-full-bit")options.k_full_bit=std::stoi(value);
         else if(arg=="--itopk")options.cagra_itopk_size=std::stoi(value);
+        else if(arg=="--uma-cpu-fullbit-fraction")options.uma_cpu_fullbit_fraction=std::stod(value);
+        else if(arg=="--uma-cpu-threads")options.uma_cpu_threads=std::stoi(value);
+        else if(arg=="--uma-cpu-pool-cpus")options.uma_cpu_pool_cpus=value;
         else throw std::invalid_argument("Unknown option "+arg);
     }
     if(index_path.empty()||query_path.empty()||output_path.empty()||!batch||!rounds||!k||!query_repeats)
@@ -141,6 +146,14 @@ int main(int argc,char** argv) try {
     Chimera::chimera_index index;
     Chimera::LoadOptions load; load.low_memory=true;
     index.load(index_path,options,load);
+    std::string pool_cpu_report = options.uma_cpu_pool_cpus;
+    if (pool_cpu_report.empty()) {
+        constexpr int efficiency_cpus[] = {0,10,1,11,2,12,3,13,4,14};
+        for (int i=0;i<options.uma_cpu_threads;++i) {
+            if(i) pool_cpu_report += ',';
+            pool_cpu_report += std::to_string(efficiency_cpus[i]);
+        }
+    }
     index.set_capture_scores(true);
     Ids reference(check_n); std::vector<std::vector<float>> ref_scores(check_n);
     for(size_t q=0;q<check_n;++q) {
@@ -166,6 +179,11 @@ int main(int argc,char** argv) try {
         <<",\"uma_cpu_refine\":"<<(options.uma_cpu_refine?"true":"false")
         <<",\"uma_cpu_candidates\":"<<(options.uma_cpu_candidates?"true":"false")
         <<",\"uma_query_buffers\":"<<(options.uma_query_buffers?"true":"false")
+        <<",\"uma_cpu_fullbit_fraction\":"<<options.uma_cpu_fullbit_fraction
+        <<",\"uma_cpu_fullbit_deferred\":"<<(options.uma_cpu_fullbit_deferred?"true":"false")
+        <<",\"uma_cpu_document\":"<<(options.uma_cpu_document?"true":"false")
+        <<",\"uma_cpu_threads\":"<<options.uma_cpu_threads
+        <<",\"uma_cpu_pool_cpus\":\""<<pool_cpu_report<<"\""
         <<",\"verify_full_bit\":"<<(options.verify_full_bit?"true":"false")
         <<",\"batch_only\":"<<(batch_only?"true":"false")
         <<",\"profile_range\":"<<(profile_range?"true":"false")

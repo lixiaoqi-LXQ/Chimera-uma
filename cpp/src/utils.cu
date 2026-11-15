@@ -28,6 +28,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <vector>
+#include <sys/mman.h>
 
 namespace Chimera {
 
@@ -329,6 +330,16 @@ void chimera_index::ensure_candidate_capacity(size_t required_rows) {
 }
 
 void chimera_index::allocate_workspace() {
+    if (options_.uma_cpu_document) {
+        int device = 0, pageable = 0, host_tables = 0;
+        check_cuda(cudaGetDevice(&device));
+        check_cuda(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device));
+        check_cuda(cudaDeviceGetAttribute(&host_tables,
+                   cudaDevAttrPageableMemoryAccessUsesHostPageTables, device));
+        if (!pageable || !host_tables)
+            throw std::runtime_error("CPU document scoring requires ATS host-page-table access");
+        ws_->cpu_document_enabled = true;
+    }
     if (options_.uma_query_buffers) {
         int device = 0, pageable = 0, host_tables = 0;
         check_cuda(cudaGetDevice(&device));
@@ -504,8 +515,23 @@ void chimera_index::allocate_workspace() {
 
     check_cuda(cudaMalloc(&ws_->d_refined_token_positions,
                           ws_->max_refined_tokens * sizeof(uint32_t)));
-    check_cuda(cudaMalloc(&ws_->d_one_bit_token_scores,
-                          ws_->max_refined_tokens * static_cast<size_t>(Q_DOCLEN) * sizeof(float)));
+    if (ws_->cpu_document_enabled) {
+        constexpr size_t page = size_t(2) << 20;
+        const size_t factors = static_cast<size_t>(Q_DOCLEN) * sizeof(float);
+        if (ws_->max_refined_tokens > (std::numeric_limits<size_t>::max() - (page - 1)) / factors)
+            throw std::overflow_error("CPU document ATS matrix size overflow");
+        const size_t bytes = ws_->max_refined_tokens * factors;
+        const size_t rounded = std::max(page, (bytes + page - 1) & ~(page - 1));
+        void* storage = nullptr;
+        if (::posix_memalign(&storage, page, rounded) != 0) throw std::bad_alloc();
+        ws_->h_cpu_document_token_scores = static_cast<float*>(storage);
+        (void)::madvise(storage, rounded, MADV_HUGEPAGE);
+        std::memset(storage, 0, rounded);
+        ws_->d_one_bit_token_scores = ws_->h_cpu_document_token_scores;
+    } else {
+        check_cuda(cudaMalloc(&ws_->d_one_bit_token_scores,
+                              ws_->max_refined_tokens * static_cast<size_t>(Q_DOCLEN) * sizeof(float)));
+    }
     if (ws_->uma_query_buffers) {
         allocate_ats_buffer(ws_->h_mapped_one_bit_document_scores,
                                ws_->d_one_bit_document_scores, ws_->max_refined_candidates);
@@ -522,7 +548,7 @@ void chimera_index::allocate_workspace() {
         check_cuda(cudaMallocHost(&ws_->h_num_refined_tokens, sizeof(size_t)));
     }
 
-    if (options_.fast_document_reduce && options_.verify_full_bit) {
+    if ((options_.fast_document_reduce || ws_->cpu_document_enabled) && options_.verify_full_bit) {
         check_cuda(cudaMalloc(&ws_->d_document_reduce_reference,
                               ws_->max_refined_candidates * sizeof(float)));
         check_cuda(cudaMallocHost(&ws_->h_document_reduce_reference,
@@ -605,6 +631,9 @@ void chimera_index::release_resources() noexcept {
     // Internal batch workers must finish and release their private workspaces
     // before any shared corpus pointer or host registration is released.
     batch_workers_.clear();
+    // Workers drop their shared references first; the owner's final reference
+    // drains and joins the pool while borrowed corpus/workspace storage exists.
+    cpu_task_pool_.reset();
     last_batch_result_scores_.clear();
 
     // Release exact-flat asynchronous users before their borrowed centroid storage.
@@ -661,7 +690,8 @@ void chimera_index::release_resources() noexcept {
             (void)cudaFreeHost(ws_->h_pinned_queries);
             (void)cudaFreeHost(ws_->h_pinned_cb1_sumq);
         }
-        (void)cudaFree(ws_->d_one_bit_token_scores);
+        if (ws_->h_cpu_document_token_scores) std::free(ws_->h_cpu_document_token_scores);
+        else (void)cudaFree(ws_->d_one_bit_token_scores);
         (void)cudaFree(ws_->d_refined_token_positions);
         if (ws_->uma_query_buffers) {
             std::free(ws_->h_mapped_one_bit_document_scores);

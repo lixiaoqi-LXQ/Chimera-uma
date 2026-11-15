@@ -61,6 +61,7 @@ add_library(chimera_core STATIC
     cpp/src/kernels.cu
     cpp/src/quantization.cpp
     cpp/src/cpu_scoring.cpp
+    cpp/src/cpu_document_reduce_pool.cpp
     cpp/src/gpu_fullbit_scoring.cu
     cpp/src/flat_l2_router.cu
     cpp/src/search_impl.cu
@@ -140,3 +141,8 @@ set_target_properties(batch_search_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATI
 add_executable(token_score_qualification tests/token_score.cu)
 target_link_libraries(token_score_qualification PRIVATE chimera_core)
 set_target_properties(token_score_qualification PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# CPU-only concurrency/error-lifetime qualification; no CUDA work is launched.
+add_executable(cpu_pool_qualification tests/cpu_pool.cpp)
+target_include_directories(cpu_pool_qualification PRIVATE cpp/src)
+target_link_libraries(cpu_pool_qualification PRIVATE OpenMP::OpenMP_CXX)

@@ -25,6 +25,7 @@ struct IVF_PG;
 class FloatInputView;
 class ReadOnlyMappedFile;
 class SpilledFullCodes;
+class CpuTaskPool;
 
 class BuildCheckpointStop final : public std::exception {
  public:
@@ -69,6 +70,11 @@ struct SearchOptions {
     bool uma_cpu_refine = false;  // CPU exact stable-radix-equivalent top-k.
     bool uma_cpu_candidates = false;  // CPU integer candidate generation; requires UMA query buffers.
     bool uma_query_buffers = false;  // Opt-in: ATS-coherent mapped query/metadata buffers.
+    double uma_cpu_fullbit_fraction = 0.0;  // Shared CPU pool scores this fraction of fullbit candidates.
+    bool uma_cpu_fullbit_deferred = false;  // Batch-only detached fullbit tails; fraction=1, chunks=1.
+    bool uma_cpu_document = false;  // Shared CPU pool reduces GPU token scores to document scores.
+    int uma_cpu_threads = 10;
+    std::string uma_cpu_pool_cpus;  // Optional comma-separated CPU IDs; empty keeps the E-core default.
 };
 
 inline void check_cuda(
@@ -195,6 +201,7 @@ class chimera_index {
     const char* full_bit_codes_data() const;
 
     struct QueryState;
+    struct PendingFullbit;  // CPU-only definition; owns all per-query task storage.
 
     struct IndexHeader {
         size_t num_embeddings;
@@ -243,6 +250,13 @@ class chimera_index {
         const int* refined_doc_ids, const int* candidate_indices, int count,
         const float* queries_flat, const QueryState* queries,
         std::pair<float, int>* scores);
+    std::shared_ptr<PendingFullbit> submit_deferred_fullbit(
+        const int* refined_doc_ids, const int* candidate_indices, int count,
+        const float* queries_flat, const QueryState* queries);
+    static void wait_deferred_fullbit(const std::shared_ptr<PendingFullbit>& job);
+    static void finish_deferred_fullbit(
+        const std::shared_ptr<PendingFullbit>& job, size_t k,
+        std::vector<size_t>& result, std::vector<float>* captured_scores);
     void initialize_gpu_full_bit();
     void release_gpu_full_bit() noexcept;
     void compute_gpu_full_bit_scores(
@@ -253,6 +267,9 @@ class chimera_index {
     // are destroyed before the owner frees that storage; no index is reloaded.
     const chimera_index* batch_owner_ = nullptr;
     std::vector<std::unique_ptr<chimera_index>> batch_workers_;
+    std::shared_ptr<CpuTaskPool> cpu_task_pool_;  // Shared by owner and all query lanes.
+    bool defer_fullbit_in_batch_ = false;  // Scoped by search_batch, never enabled by ordinary search.
+    std::shared_ptr<PendingFullbit> pending_fullbit_;  // Published into the current batch before reuse.
     std::vector<std::vector<float>> last_batch_result_scores_;
     const chimera_index& corpus() const { return batch_owner_ ? *batch_owner_ : *this; }
 

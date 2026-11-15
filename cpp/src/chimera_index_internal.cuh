@@ -14,6 +14,8 @@ namespace Chimera {
 struct chimera_index::Workspace {
     // Actual enabled state; set only after verifying ATS/host-page-table access.
     bool uma_query_buffers = false;
+    bool cpu_document_enabled = false;
+    float* h_cpu_document_token_scores = nullptr;  // Sole owner; d_one_bit_token_scores aliases ATS.
     uint32_t* h_cpu_candidate_bitmap = nullptr;
     uint32_t* h_cpu_cagra_labels = nullptr;
     int* h_cpu_materialized_ids = nullptr;

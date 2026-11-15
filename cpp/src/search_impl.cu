@@ -11,6 +11,8 @@
 #include "chimera/config.cuh"
 #include "chimera/chunk_partition.hpp"
 #include "chimera/cpu_candidate_generation.hpp"
+#include "chimera/cpu_document_reduce_pool.hpp"
+#include "cpu_task_pool.hpp"
 #include "chimera/cpu_refine_topk.hpp"
 #include "chimera/profiling.hpp"
 #include "chimera/ivf_pg.hpp"
@@ -600,7 +602,20 @@ void chimera_index::collaborative_document_scoring(
         }
 
         if (chunk_count > 0) {
-            if (options_.fast_document_reduce) {
+            if (ws_->cpu_document_enabled) {
+                if (options_.verify_full_bit) {
+                    one_bit_document_score_kernel<<<chunk_count, score_threads, 0, stream>>>(
+                        ws_->d_one_bit_token_scores,
+                        ws_->d_refined_doc_offsets + chunk_start,
+                        ws_->d_document_reduce_reference + chunk_start,
+                        total_tokens, chunk_count);
+                    check_cuda(cudaGetLastError());
+                    check_cuda(cudaMemcpyAsync(
+                        ws_->h_document_reduce_reference + chunk_start,
+                        ws_->d_document_reduce_reference + chunk_start,
+                        chunk_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                }
+            } else if (options_.fast_document_reduce) {
                 one_bit_document_score_fast_kernel<<<chunk_count, 128, 0, stream>>>(
                     ws_->d_one_bit_token_scores,
                     ws_->d_refined_doc_offsets + chunk_start,
@@ -631,7 +646,7 @@ void chimera_index::collaborative_document_scoring(
 
         check_cuda(cudaEventRecord(chunk_compute_done[chunk], stream));
 
-        if (!ws_->uma_query_buffers) {
+        if (!ws_->uma_query_buffers && !ws_->cpu_document_enabled) {
             check_cuda(cudaStreamWaitEvent(
                 stream_d2h, chunk_compute_done[chunk], 0));
             if (chunk_count > 0) check_cuda(cudaMemcpyAsync(
@@ -664,19 +679,38 @@ void chimera_index::collaborative_document_scoring(
         const int chunk_count = chunk_end - chunk_start;
         {
             ProfileRange wait(profiling_enabled_, "Chimera/wait_chunk", chunk);
-            check_cuda(cudaEventSynchronize(ws_->uma_query_buffers
+            check_cuda(cudaEventSynchronize((ws_->uma_query_buffers || ws_->cpu_document_enabled)
                 ? chunk_compute_done[chunk] : chunk_d2h_done[chunk]));
         }
 
-        if (options_.fast_document_reduce && options_.verify_full_bit) {
+        if (ws_->cpu_document_enabled && chunk_count > 0) {
+            if (!cpu_task_pool_) throw std::runtime_error("CPU document worker pool is unavailable");
+            ProfileRange cpu_reduce(profiling_enabled_, "Chimera/cpu_document_pool_reduce", chunk);
+            constexpr size_t docs_per_tile = 32;
+            const size_t tile_count = (static_cast<size_t>(chunk_count) + docs_per_tile - 1) / docs_per_tile;
+            const float* scores = ws_->h_cpu_document_token_scores;
+            const size_t* offsets = ws_->h_pinned_refined_doc_offsets;
+            float* outputs = ws_->h_mapped_one_bit_document_scores;
+            auto group = cpu_task_pool_->submit(tile_count, 1,
+                [scores, offsets, outputs, total_tokens, chunk_start, chunk_end](size_t tile) {
+                    const size_t first = static_cast<size_t>(chunk_start) + tile * size_t(32);
+                    const size_t count = std::min(size_t(32), static_cast<size_t>(chunk_end) - first);
+                    score_one_bit_documents_cpu_pool(scores, offsets + first,
+                        outputs + first, total_tokens, count);
+                });
+            group->wait();
+        }
+
+        if ((options_.fast_document_reduce || ws_->cpu_document_enabled) && options_.verify_full_bit) {
             for (int i = chunk_start; i < chunk_end; ++i) {
                 if (std::memcmp(&ws_->h_document_reduce_reference[i],
                                 &ws_->h_mapped_one_bit_document_scores[i], sizeof(float))) {
-                    throw std::runtime_error("Fast GPU document reduction differs from original at candidate " +
+                    throw std::runtime_error("Document reduction differs from original at candidate " +
                                              std::to_string(i));
                 }
             }
-            std::cout << "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=" << chunk_count
+            std::cout << (ws_->cpu_document_enabled ? "[CPU_DOCUMENT_POOL_VERIFY] candidates="
+                                                   : "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=") << chunk_count
                       << " scores_fp32_bitwise=passed\n";
         }
 
@@ -737,6 +771,21 @@ void chimera_index::collaborative_document_scoring(
                 newly_selected_candidates[i].second;
         }
 
+        }
+
+        if (defer_fullbit_in_batch_) {
+            if (num_chunks != 1 || options_.uma_cpu_fullbit_fraction != 1.0 || pending_fullbit_)
+                throw std::logic_error("Invalid deferred fullbit batch state");
+            // Copy every per-query input before releasing this workspace.
+            // The factory also captures GPU verification while d_queries is
+            // still the current query, then submits independent CPU work.
+            pending_fullbit_ = submit_deferred_fullbit(
+                refined_doc_ids, full_bit_candidate_indices.data(),
+                num_full_bit_candidates, ws_->h_pinned_queries, queries);
+            for (int doc_id : seen_doc_list) seen_doc_map[doc_id] = false;
+            result.clear();
+            last_result_scores_.clear();
+            return;
         }
 
         compute_full_bit_scores(

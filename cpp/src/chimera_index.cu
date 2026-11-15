@@ -11,6 +11,7 @@
 #include "chimera/ivf_pg.hpp"
 #include "chimera/quantization.hpp"
 #include "chimera_index_internal.cuh"
+#include "cpu_task_pool.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 
 #include <raft/core/resources.hpp>
@@ -22,6 +23,7 @@
 #include <omp.h>
 #include <exception>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <limits>
@@ -32,6 +34,16 @@
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    if (!std::isfinite(options.uma_cpu_fullbit_fraction) ||
+        options.uma_cpu_fullbit_fraction < 0 || options.uma_cpu_fullbit_fraction > 1)
+        throw std::invalid_argument("UMA CPU fullbit fraction must be in [0,1]");
+    if (options.uma_cpu_fullbit_fraction > 0 && !options.gpu_full_bit)
+        throw std::invalid_argument("UMA CPU fullbit cooperation requires the GPU fullbit backend");
+    if (options.uma_cpu_fullbit_deferred &&
+        (options.uma_cpu_fullbit_fraction != 1.0 || options.num_chunks != 1))
+        throw std::invalid_argument("Deferred CPU fullbit requires fraction=1 and chunks=1");
+    CpuTaskPool::validate_cpu_selection(static_cast<size_t>(options.uma_cpu_threads),
+        CpuTaskPool::parse_cpu_list(options.uma_cpu_pool_cpus));
     if (options.uma_cpu_refine && (!options.uma_cpu_candidates || !options.uma_query_buffers))
         throw std::invalid_argument("UMA CPU refine requires CPU candidates and UMA query buffers");
     if (options.uma_cpu_refine && skips_candidate_refinement(options.algorithm_variant))
@@ -372,6 +384,14 @@ void chimera_index::initialize_search_state() {
               << " token_score_bytes=" << ws_->max_refined_tokens * size_t(Q_DOCLEN) * sizeof(float)
               << " CR_arena=" << (skips_candidate_refinement(options_.algorithm_variant) ? "absent" : "original")
               << " flat_scratch_bytes=" << (ws_->flat_router ? ws_->flat_router->scratch_bytes() : 0) << '\n';
+    if (!batch_owner_ && (options_.uma_cpu_fullbit_fraction > 0 || options_.uma_cpu_document)) {
+        cpu_task_pool_ = std::make_shared<CpuTaskPool>(options_.uma_cpu_threads,
+            CpuTaskPool::parse_cpu_list(options_.uma_cpu_pool_cpus));
+        std::cout << "[CPU_POOL] workers=" << options_.uma_cpu_threads
+                  << " cores=" << (options_.uma_cpu_pool_cpus.empty() ? "E-default" : options_.uma_cpu_pool_cpus)
+                  << " fullbit_fraction=" << options_.uma_cpu_fullbit_fraction
+                  << " document_reduce=" << options_.uma_cpu_document << '\n';
+    }
     search_ready_ = true;
 }
 
@@ -392,6 +412,7 @@ void chimera_index::prepare_batch(size_t workers) {
         auto worker = std::make_unique<chimera_index>();
         worker->batch_owner_ = this;
         worker->options_ = options_;
+        worker->cpu_task_pool_ = cpu_task_pool_;
         worker->n = n;
         worker->d = d;
         worker->n_clusters = n_clusters;
@@ -433,6 +454,8 @@ std::vector<std::vector<size_t>> chimera_index::search_batch(
     if (!count) return {};
     workers = std::min(workers, count);
     prepare_batch(workers);
+    const bool deferred = options_.uma_cpu_fullbit_deferred && count > 1;
+    std::vector<std::shared_ptr<PendingFullbit>> jobs(deferred ? count : 0);
     std::vector<std::vector<size_t>> results(count);
     if (capture_scores_) last_batch_result_scores_.resize(count);
     const bool capture = capture_scores_;
@@ -448,24 +471,69 @@ std::vector<std::vector<size_t>> chimera_index::search_batch(
         auto& worker = lane == 0 ? *this : *batch_workers_[lane - 1];
         worker.capture_scores_ = capture;
         worker.profiling_enabled_ = profile;
+        worker.defer_fullbit_in_batch_ = deferred;
+        size_t active_query = count;
         try {
             check_cuda(cudaSetDevice(device));
             for (size_t q = lane; q < count; q += workers) {
+                active_query = q;
                 results[q] = worker.search_one(queries + q * stride, k);
-                if (capture) last_batch_result_scores_[q] = worker.last_result_scores_;
+                if (deferred && worker.pending_fullbit_) {
+                    // The job owns its query/IDs/scores. This lane can reuse
+                    // its workspace immediately for the next GPU front end.
+                    jobs[q] = std::move(worker.pending_fullbit_);
+                } else if (capture) {
+                    last_batch_result_scores_[q] = worker.last_result_scores_;
+                }
             }
         } catch (...) {
+            // Retain a job even if an exception occurs after publication but
+            // before the ordinary hand-off. Every published group is drained.
+            if (deferred && active_query < count && worker.pending_fullbit_)
+                jobs[active_query] = std::move(worker.pending_fullbit_);
             errors[lane] = std::current_exception();
         }
+        worker.defer_fullbit_in_batch_ = false;
     }
+    std::exception_ptr failure;
     for (const auto& error : errors) {
-        if (error) {
-            // Drain all GPU users before propagating a failure. Invalidate the
-            // index rather than reuse partially modified candidate/seen state.
-            (void)cudaDeviceSynchronize();
-            release_resources();
-            std::rethrow_exception(error);
+        if (error && !failure) failure = error;
+    }
+    // This is still a synchronous public API. Complete every detached tail
+    // before returning, releasing workspace/corpus, or rethrowing an error.
+    for (size_t q = 0; q < jobs.size(); ++q) {
+        if (!jobs[q]) continue;
+        try {
+            if (failure) {
+                wait_deferred_fullbit(jobs[q]);
+            } else {
+                finish_deferred_fullbit(jobs[q], k, results[q],
+                    capture ? &last_batch_result_scores_[q] : nullptr);
+            }
+        } catch (...) {
+            if (!failure) failure = std::current_exception();
         }
+        jobs[q].reset();
+    }
+    if (deferred && capture && !failure) {
+        try {
+            // Preserve each lane's last_result_scores() observation as well
+            // as the explicit input-ordered batch score arrays.
+            for (size_t lane = 0; lane < workers; ++lane) {
+                const size_t last_query = lane + ((count - 1 - lane) / workers) * workers;
+                auto& worker = lane == 0 ? *this : *batch_workers_[lane - 1];
+                worker.last_result_scores_ = last_batch_result_scores_[last_query];
+            }
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    }
+    if (failure) {
+        // CPU groups have all joined; now drain GPU users before freeing the
+        // borrowed corpus. The batch has no outstanding cross-call work.
+        (void)cudaDeviceSynchronize();
+        release_resources();
+        std::rethrow_exception(failure);
     }
     return results;
 }
