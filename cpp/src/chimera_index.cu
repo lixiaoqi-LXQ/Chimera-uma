@@ -83,6 +83,48 @@ void chimera_index::validate_search_options(const SearchOptions& options) {
 
 chimera_index::chimera_index() = default;
 
+ReadOnlyFullbitCodesView chimera_index::borrow_fullbit_codes() const {
+    const auto& owner = corpus();
+    if (!owner.has_index_ || !owner.search_ready_ || !owner.options_.gpu_full_bit ||
+        !owner.low_memory_load_ || !owner.mapped_full_bit_data_ ||
+        owner.ex_bits != 3 || PADDED_DIM != 128 ||
+        !owner.ws_ || !owner.ws_->gpu_full_codes) {
+        throw std::logic_error("Fullbit borrow requires prepared, mmap-backed 4bit GPU scoring");
+    }
+    const char* cpu_data = owner.full_bit_codes_data();
+    int device = 0, pageable_access = 0, host_page_tables = 0;
+    check_cuda(cudaGetDevice(&device), "Inspecting fullbit borrow device");
+    check_cuda(cudaDeviceGetAttribute(&pageable_access, cudaDevAttrPageableMemoryAccess, device),
+               "Inspecting fullbit ATS access");
+    check_cuda(cudaDeviceGetAttribute(&host_page_tables,
+               cudaDevAttrPageableMemoryAccessUsesHostPageTables, device),
+               "Inspecting fullbit host page tables");
+    if (owner.ws_->gpu_full_codes != cpu_data ||
+        !pageable_access || !host_page_tables ||
+        owner.n > std::numeric_limits<size_t>::max() / 64 ||
+        owner.doc_ptrs_.size() != owner.num_docs + 1) {
+        throw std::logic_error("Fullbit borrow requires the unchanged CPU/GPU ATS allocation");
+    }
+    ReadOnlyFullbitCodesView view;
+    view.cpu_data = cpu_data;
+    view.gpu_data = owner.ws_->gpu_full_codes;
+    view.bytes = owner.n * 64;
+    view.token_count = owner.n;
+    view.document_count = owner.num_docs;
+    view.document_offsets = owner.doc_ptrs_.data();
+    view.backing_file = (std::filesystem::path(owner.load_directory_) / "doc_full.bin").string();
+    view.ats_alias = true;
+    // prepare_batch(4) creates the owner lane plus three borrowing workspaces.
+    view.lane_gpu_data.push_back(owner.ws_->gpu_full_codes);
+    for (const auto& lane : owner.batch_workers_) {
+        if (!lane->search_ready_ || !lane->ws_ || lane->ws_->gpu_full_codes != cpu_data) {
+            throw std::logic_error("A prepared lane does not alias the borrowed fullbit allocation");
+        }
+        view.lane_gpu_data.push_back(lane->ws_->gpu_full_codes);
+    }
+    return view;
+}
+
 void chimera_index::begin_initialization(const SearchOptions& options) {
     release_resources();
     options_ = options;

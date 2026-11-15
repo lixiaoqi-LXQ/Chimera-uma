@@ -48,6 +48,20 @@ struct LoadOptions {
     bool prefault_full_codes = true;
 };
 
+// Diagnostic borrow of the allocation already used by GPU fullbit scoring.
+// Read-only; valid only while this index and its prepared lanes remain alive.
+struct ReadOnlyFullbitCodesView {
+    const char* cpu_data = nullptr;
+    const char* gpu_data = nullptr;
+    size_t bytes = 0;
+    size_t token_count = 0;
+    size_t document_count = 0;
+    const int* document_offsets = nullptr;
+    std::vector<const char*> lane_gpu_data;
+    std::string backing_file;
+    bool ats_alias = false;
+};
+
 enum class AlgorithmVariant { Full, NoCR, NoIVFPG, Neither };
 inline bool skips_candidate_refinement(AlgorithmVariant v) { return v == AlgorithmVariant::NoCR || v == AlgorithmVariant::Neither; }
 inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == AlgorithmVariant::NoIVFPG || v == AlgorithmVariant::Neither; }
@@ -165,6 +179,7 @@ class chimera_index {
     // object must not be called concurrently (including load/save/search).
     // Allocate reusable worker workspaces outside throughput timing.
     void prepare_batch(size_t workers);
+    ReadOnlyFullbitCodesView borrow_fullbit_codes() const;
     std::vector<std::vector<size_t>> search_batch(
         const float* queries, size_t query_values, size_t k, size_t workers);
     const std::vector<std::vector<float>>& last_batch_result_scores() const {

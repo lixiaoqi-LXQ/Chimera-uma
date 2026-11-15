@@ -137,6 +137,27 @@ add_executable(batch_search_benchmark tests/batch_search.cpp)
 target_link_libraries(batch_search_benchmark PRIVATE chimera_core)
 set_target_properties(batch_search_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+# The research harness borrows the existing ATS allocation; an independent
+# Chimera checkout does not need the surrounding experiment sources.
+set(READ_INTERFERENCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../systems/chimera/uma-prerequisites")
+if(EXISTS "${READ_INTERFERENCE_DIR}/read_interference.cpp" AND
+   EXISTS "${READ_INTERFERENCE_DIR}/read_interference_benchmark.cpp")
+    add_executable(read_interference_benchmark
+        "${READ_INTERFERENCE_DIR}/read_interference.cpp"
+        "${READ_INTERFERENCE_DIR}/read_interference_benchmark.cpp")
+    target_include_directories(read_interference_benchmark PRIVATE "${READ_INTERFERENCE_DIR}")
+    target_link_libraries(read_interference_benchmark PRIVATE chimera_core)
+    set_target_properties(read_interference_benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    if(EXISTS "${READ_INTERFERENCE_DIR}/read_interference_qualification.cpp")
+        find_package(Threads REQUIRED)
+        add_executable(read_interference_qualification
+            "${READ_INTERFERENCE_DIR}/read_interference.cpp"
+            "${READ_INTERFERENCE_DIR}/read_interference_qualification.cpp")
+        target_include_directories(read_interference_qualification PRIVATE "${READ_INTERFERENCE_DIR}")
+        target_link_libraries(read_interference_qualification PRIVATE Threads::Threads)
+    endif()
+endif()
+
 # Explicit correctness executable; never runs as part of compilation.
 add_executable(token_score_qualification tests/token_score.cu)
 target_link_libraries(token_score_qualification PRIVATE chimera_core)
