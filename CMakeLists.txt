@@ -156,6 +156,14 @@ if(EXISTS "${READ_INTERFERENCE_DIR}/read_interference.cpp" AND
         target_include_directories(read_interference_qualification PRIVATE "${READ_INTERFERENCE_DIR}")
         target_link_libraries(read_interference_qualification PRIVATE Threads::Threads)
     endif()
+    if(EXISTS "${READ_INTERFERENCE_DIR}/read_interference_hotset_qualification.cpp")
+        find_package(Threads REQUIRED)
+        add_executable(read_interference_hotset_qualification
+            "${READ_INTERFERENCE_DIR}/read_interference.cpp"
+            "${READ_INTERFERENCE_DIR}/read_interference_hotset_qualification.cpp")
+        target_include_directories(read_interference_hotset_qualification PRIVATE "${READ_INTERFERENCE_DIR}")
+        target_link_libraries(read_interference_hotset_qualification PRIVATE Threads::Threads)
+    endif()
 endif()
 
 # Explicit correctness executable; never runs as part of compilation.
