@@ -513,6 +513,7 @@ void chimera_index::allocate_workspace() {
         check_cuda(cudaMallocHost(&ws_->h_pinned_cb1_sumq, Q_DOCLEN * sizeof(float)));
     }
 
+    if (!options_.uma_cpu_onebit_fused || options_.verify_full_bit)
     check_cuda(cudaMalloc(&ws_->d_refined_token_positions,
                           ws_->max_refined_tokens * sizeof(uint32_t)));
     if (ws_->cpu_document_enabled) {
@@ -528,7 +529,7 @@ void chimera_index::allocate_workspace() {
         (void)::madvise(storage, rounded, MADV_HUGEPAGE);
         std::memset(storage, 0, rounded);
         ws_->d_one_bit_token_scores = ws_->h_cpu_document_token_scores;
-    } else {
+    } else if (!options_.uma_cpu_onebit_fused || options_.verify_full_bit) {
         check_cuda(cudaMalloc(&ws_->d_one_bit_token_scores,
                               ws_->max_refined_tokens * static_cast<size_t>(Q_DOCLEN) * sizeof(float)));
     }
@@ -548,7 +549,7 @@ void chimera_index::allocate_workspace() {
         check_cuda(cudaMallocHost(&ws_->h_num_refined_tokens, sizeof(size_t)));
     }
 
-    if ((options_.fast_document_reduce || ws_->cpu_document_enabled) && options_.verify_full_bit) {
+    if ((options_.fast_document_reduce || ws_->cpu_document_enabled || options_.uma_cpu_onebit_fused) && options_.verify_full_bit) {
         check_cuda(cudaMalloc(&ws_->d_document_reduce_reference,
                               ws_->max_refined_candidates * sizeof(float)));
         check_cuda(cudaMallocHost(&ws_->h_document_reduce_reference,
@@ -653,12 +654,17 @@ void chimera_index::release_resources() noexcept {
     if (!batch_owner_) {
     (void)cudaFree(d_doc_ptrs_);
     (void)cudaFree(d_cluster_pos_);
-    (void)cudaFree(d_clustered_one_bit_codes_);
-    (void)cudaFree(d_clustered_one_bit_factors_);
+    if (h_shared_onebit_codes_) std::free(h_shared_onebit_codes_);
+    else (void)cudaFree(d_clustered_one_bit_codes_);
+    if (h_shared_onebit_factors_) std::free(h_shared_onebit_factors_);
+    else (void)cudaFree(d_clustered_one_bit_factors_);
+    h_shared_onebit_codes_ = nullptr; h_shared_onebit_factors_ = nullptr;
     if (h_uma_clustered_doc_ids_) std::free(h_uma_clustered_doc_ids_);
     else (void)cudaFree(d_clustered_doc_ids_);
     h_uma_clustered_doc_ids_ = nullptr;
-    (void)cudaFree(d_token_to_cluster_pos_);
+    if (h_shared_onebit_inverse_) std::free(h_shared_onebit_inverse_);
+    else (void)cudaFree(d_token_to_cluster_pos_);
+    h_shared_onebit_inverse_ = nullptr;
     }
 
     if (ws_ != nullptr) {

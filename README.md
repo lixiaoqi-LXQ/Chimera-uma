@@ -166,3 +166,14 @@ comparison. The research repository tracks the snapshot in
 equally to the three named stages through `SearchOptions`; the original
 Chimera scoring kernels remain unchanged. Routing parameter gains are reported
 separately from CPU cooperation, with recall checked on the complete query set.
+
+### Experimental shared 1bit CPU scorer
+
+The custom stage has independent `--shared-onebit-corpus` placement and
+`--uma-cpu-onebit-fused` calculation switches. Fused scoring uses a CPU pool
+to calculate token and document scores from the same ATS corpus allocation
+read by the GPU. Both switches default to false. The original GPU scoring
+kernels are unchanged. With `--verify-full-bit`, the fused path also checks
+every refined document score against the original GPU token/document path
+on the same candidates. This experiment requires chunks1 and keeps the
+archived kernel and small-buffer switches disabled.

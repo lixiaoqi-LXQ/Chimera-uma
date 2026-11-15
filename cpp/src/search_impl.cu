@@ -12,6 +12,7 @@
 #include "chimera/chunk_partition.hpp"
 #include "chimera/cpu_candidate_generation.hpp"
 #include "chimera/cpu_document_reduce_pool.hpp"
+#include "chimera/cpu_onebit_fused.hpp"
 #include "cpu_task_pool.hpp"
 #include "chimera/cpu_refine_topk.hpp"
 #include "chimera/profiling.hpp"
@@ -507,6 +508,7 @@ void chimera_index::collaborative_document_scoring(
         }
     }
 
+    if (!options_.uma_cpu_onebit_fused || options_.verify_full_bit) {
     gather_refined_token_positions_kernel<<<
         num_refined_candidates, 256, 0, stream>>>(
         refined_ids,
@@ -518,6 +520,7 @@ void chimera_index::collaborative_document_scoring(
     );
     check_cuda(cudaGetLastError());
 
+    }
     if (!ws_->uma_query_buffers) {
         check_cuda(cudaMemcpyAsync(
             ws_->h_num_refined_tokens,
@@ -555,6 +558,11 @@ void chimera_index::collaborative_document_scoring(
             throw std::runtime_error("Profile refined token count disagrees with actual document offsets");
     }
 
+    std::shared_ptr<CpuOnebitLut> fused_lut;
+    if (options_.uma_cpu_onebit_fused) {
+        fused_lut=std::make_shared<CpuOnebitLut>();
+        build_cpu_onebit_lut(ws_->h_pinned_queries,*fused_lut);
+    }
     // Score the chunks on the GPU while completed chunks stream to the CPU.
     int score_threads = 128;
     while (score_threads < Q_DOCLEN && score_threads < 256) score_threads *= 2;
@@ -583,7 +591,7 @@ void chimera_index::collaborative_document_scoring(
             ws_->h_pinned_refined_doc_offsets[chunk_end];
         const size_t token_count = token_end - token_start;
 
-        if (token_count > 0) {
+        if (token_count > 0 && (!options_.uma_cpu_onebit_fused || options_.verify_full_bit)) {
             const int token_blocks = (token_count + 255) / 256;
             const size_t lut_shared_memory =
                 DOCUMENT_SCORING_LUT_SMEM_FLOATS * sizeof(float) +
@@ -614,8 +622,8 @@ void chimera_index::collaborative_document_scoring(
             check_cuda(cudaGetLastError());
         }
 
-        if (chunk_count > 0) {
-            if (ws_->cpu_document_enabled) {
+        if (chunk_count > 0 && (!options_.uma_cpu_onebit_fused || options_.verify_full_bit)) {
+            if (ws_->cpu_document_enabled || options_.uma_cpu_onebit_fused) {
                 if (options_.verify_full_bit) {
                     one_bit_document_score_kernel<<<chunk_count, score_threads, 0, stream>>>(
                         ws_->d_one_bit_token_scores,
@@ -659,7 +667,7 @@ void chimera_index::collaborative_document_scoring(
 
         check_cuda(cudaEventRecord(chunk_compute_done[chunk], stream));
 
-        if (!ws_->uma_query_buffers && !ws_->cpu_document_enabled) {
+        if (!ws_->uma_query_buffers && !ws_->cpu_document_enabled && !options_.uma_cpu_onebit_fused) {
             check_cuda(cudaStreamWaitEvent(
                 stream_d2h, chunk_compute_done[chunk], 0));
             if (chunk_count > 0) check_cuda(cudaMemcpyAsync(
@@ -692,8 +700,29 @@ void chimera_index::collaborative_document_scoring(
         const int chunk_count = chunk_end - chunk_start;
         {
             ProfileRange wait(profiling_enabled_, "Chimera/wait_chunk", chunk);
-            check_cuda(cudaEventSynchronize((ws_->uma_query_buffers || ws_->cpu_document_enabled)
+            check_cuda(cudaEventSynchronize((ws_->uma_query_buffers || ws_->cpu_document_enabled || options_.uma_cpu_onebit_fused)
                 ? chunk_compute_done[chunk] : chunk_d2h_done[chunk]));
+        }
+
+        if (options_.uma_cpu_onebit_fused && chunk_count > 0) {
+            if (!cpu_task_pool_) throw std::runtime_error("CPU onebit fused pool unavailable");
+            const auto& shared=corpus();
+            if (!shared.h_shared_onebit_codes_ || !shared.h_shared_onebit_factors_ || !shared.h_shared_onebit_inverse_)
+                throw std::runtime_error("CPU onebit fused corpus is not shared ATS storage");
+            ProfileRange cpu_fused(profiling_enabled_,"Chimera/cpu_onebit_fused",profile_query_id_);
+            const auto* codes=reinterpret_cast<const uint8_t*>(shared.h_shared_onebit_codes_);
+            const float* factors=shared.h_shared_onebit_factors_;
+            const uint32_t* inverse=shared.h_shared_onebit_inverse_;
+            const int* ptrs=shared.doc_ptrs_.data();
+            const float* cb=ws_->h_pinned_cb1_sumq;
+            float* outputs=ws_->h_mapped_one_bit_document_scores;
+            auto group=cpu_task_pool_->submit(size_t(chunk_count),8,
+                [=](size_t ordinal) {
+                    size_t i=size_t(chunk_start)+ordinal;
+                    outputs[i]=score_cpu_onebit_document(codes,factors,inverse,ptrs,
+                        refined_doc_ids[i],*fused_lut,cb);
+                });
+            group->wait();
         }
 
         if (ws_->cpu_document_enabled && chunk_count > 0) {
@@ -719,7 +748,7 @@ void chimera_index::collaborative_document_scoring(
             group->wait();
         }
 
-        if ((options_.fast_document_reduce || ws_->cpu_document_enabled) && options_.verify_full_bit) {
+        if ((options_.fast_document_reduce || ws_->cpu_document_enabled || options_.uma_cpu_onebit_fused) && options_.verify_full_bit) {
             for (int i = chunk_start; i < chunk_end; ++i) {
                 if (std::memcmp(&ws_->h_document_reduce_reference[i],
                                 &ws_->h_mapped_one_bit_document_scores[i], sizeof(float))) {
@@ -727,7 +756,8 @@ void chimera_index::collaborative_document_scoring(
                                              std::to_string(i));
                 }
             }
-            std::cout << (ws_->cpu_document_enabled ? "[CPU_DOCUMENT_POOL_VERIFY] candidates="
+            std::cout << (options_.uma_cpu_onebit_fused ? "[CPU_ONEBIT_FUSED_VERIFY] candidates="
+                          : ws_->cpu_document_enabled ? "[CPU_DOCUMENT_POOL_VERIFY] candidates="
                                                    : "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=") << chunk_count
                       << " scores_fp32_bitwise=passed\n";
         }

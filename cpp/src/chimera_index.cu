@@ -30,12 +30,17 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    if (options.uma_cpu_onebit_fused && (options.num_chunks != 1 || options.uma_cpu_document ||
+        options.compact_token_score || options.fast_document_reduce || options.uma_query_buffers ||
+        options.uma_cpu_candidates || options.uma_cpu_refine))
+        throw std::invalid_argument("CPU onebit fused requires chunks=1, original GPU kernels and small-buffer/other CPU onebit flags off");
     if (!std::isfinite(options.uma_cpu_fullbit_fraction) ||
         options.uma_cpu_fullbit_fraction < 0 || options.uma_cpu_fullbit_fraction > 1)
         throw std::invalid_argument("UMA CPU fullbit fraction must be in [0,1]");
@@ -408,6 +413,40 @@ void chimera_index::initialize_search_state() {
                               n * sizeof(uint32_t), cudaMemcpyHostToDevice));
     }
 
+    if (options_.shared_onebit_corpus || options_.uma_cpu_onebit_fused) {
+        int device=0, pageable=0, host_tables=0;
+        check_cuda(cudaGetDevice(&device));
+        check_cuda(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device));
+        check_cuda(cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device));
+        if (!pageable || !host_tables || PADDED_DIM != 128)
+            throw std::runtime_error("Shared onebit corpus requires D128 and ATS host page tables");
+        // Commit each segment only after allocation, prefault and copy succeed.
+        // Partial initialization cleanup inspects actual host owners, not flags.
+        auto migrate = [&](auto*& device_ptr, auto*& owner, size_t bytes, const char* name) {
+            constexpr size_t page = size_t(2) << 20;
+            if (bytes > std::numeric_limits<size_t>::max()-(page-1))
+                throw std::overflow_error("Shared onebit corpus size overflow");
+            size_t rounded=std::max(page,(bytes+page-1)&~(page-1));
+            void* raw=nullptr;
+            if (posix_memalign(&raw,page,rounded)) throw std::bad_alloc();
+            std::unique_ptr<void, decltype(&std::free)> guard(raw,&std::free);
+            if (madvise(raw,rounded,MADV_HUGEPAGE))
+                throw std::runtime_error("Shared onebit corpus MADV_HUGEPAGE failed");
+            std::memset(raw,0,rounded);
+            check_cuda(cudaMemcpy(raw,device_ptr,bytes,cudaMemcpyDeviceToHost));
+            check_cuda(cudaFree(device_ptr));
+            using Pointer=typename std::remove_reference<decltype(device_ptr)>::type;
+            owner=static_cast<Pointer>(guard.release()); device_ptr=owner;
+            std::cout << "[SHARED_ONEBIT_CORPUS] name=" << name << " cpu_ptr=" << raw
+                      << " gpu_ptr=" << static_cast<const void*>(device_ptr)
+                      << " bytes=" << bytes << " allocated_bytes=" << rounded
+                      << " thp_requested=1 alignment=" << page << " same_allocation=1\n";
+        };
+        migrate(d_clustered_one_bit_codes_,h_shared_onebit_codes_,n*code_per_vec,"codes");
+        migrate(d_clustered_one_bit_factors_,h_shared_onebit_factors_,n*sizeof(float),"factors");
+        migrate(d_token_to_cluster_pos_,h_shared_onebit_inverse_,n*sizeof(uint32_t),"inverse");
+    }
+
     if (uses_flat_centroid_route(options_.algorithm_variant)) {
         if (!options_.expected_coarse_clusters || n_clusters != options_.expected_coarse_clusters)
             throw std::invalid_argument("Flat algorithm ablation requires the explicitly declared coarse cluster count");
@@ -455,7 +494,7 @@ void chimera_index::initialize_search_state() {
               << " token_score_bytes=" << ws_->max_refined_tokens * size_t(Q_DOCLEN) * sizeof(float)
               << " CR_arena=" << (skips_candidate_refinement(options_.algorithm_variant) ? "absent" : "original")
               << " flat_scratch_bytes=" << (ws_->flat_router ? ws_->flat_router->scratch_bytes() : 0) << '\n';
-    if (!batch_owner_ && (options_.uma_cpu_fullbit_fraction > 0 || options_.uma_cpu_document)) {
+    if (!batch_owner_ && (options_.uma_cpu_fullbit_fraction > 0 || options_.uma_cpu_document || options_.uma_cpu_onebit_fused)) {
         cpu_task_pool_ = std::make_shared<CpuTaskPool>(options_.uma_cpu_threads,
             CpuTaskPool::parse_cpu_list(options_.uma_cpu_pool_cpus));
         std::cout << "[CPU_POOL] workers=" << options_.uma_cpu_threads

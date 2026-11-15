@@ -92,6 +92,8 @@ struct SearchOptions {
     bool uma_query_buffers = false;  // Opt-in: ATS-coherent mapped query/metadata buffers.
     double uma_cpu_fullbit_fraction = 0.0;  // Shared CPU pool scores this fraction of fullbit candidates.
     bool uma_cpu_fullbit_deferred = false;  // Batch-only detached fullbit tails; fraction=1, chunks=1.
+    bool shared_onebit_corpus = false;  // Placement-only control: GPU and CPU share ATS codes/factors/inverse.
+    bool uma_cpu_onebit_fused = false;  // Implies shared corpus; CPU token+document scoring, chunks=1.
     bool uma_cpu_document = false;  // Shared CPU pool reduces GPU token scores to document scores.
     int uma_cpu_threads = 10;
     std::string uma_cpu_pool_cpus;  // Optional comma-separated CPU IDs; empty keeps the E-core default.
@@ -367,6 +369,9 @@ class chimera_index {
 
     int* d_doc_ptrs_ = nullptr;
     size_t* d_cluster_pos_ = nullptr;
+    char* h_shared_onebit_codes_ = nullptr;  // Owner only; corresponding d_ pointer aliases this.
+    float* h_shared_onebit_factors_ = nullptr;
+    uint32_t* h_shared_onebit_inverse_ = nullptr;
     char* d_clustered_one_bit_codes_ = nullptr;
     float* d_clustered_one_bit_factors_ = nullptr;
     int* d_clustered_doc_ids_ = nullptr;

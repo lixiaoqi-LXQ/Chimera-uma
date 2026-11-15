@@ -62,6 +62,7 @@ add_library(chimera_core STATIC
     cpp/src/quantization.cpp
     cpp/src/cpu_scoring.cpp
     cpp/src/cpu_document_reduce_pool.cpp
+    cpp/src/cpu_onebit_fused.cpp
     cpp/src/gpu_fullbit_scoring.cu
     cpp/src/flat_l2_router.cu
     cpp/src/search_impl.cu
@@ -180,3 +181,7 @@ target_link_libraries(cpu_pool_qualification PRIVATE OpenMP::OpenMP_CXX)
 add_executable(chimera_phase_sampling tests/phase_sampling.cpp)
 target_link_libraries(chimera_phase_sampling PRIVATE chimera_core)
 set_target_properties(chimera_phase_sampling PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# CPU fused onebit candidate preserves the original scalar FP32 addition tree.
+set_source_files_properties(cpp/src/cpu_onebit_fused.cpp PROPERTIES
+    COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
