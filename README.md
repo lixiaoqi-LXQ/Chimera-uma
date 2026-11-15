@@ -1,4 +1,4 @@
-# Chimera+
+# Chimera: batch → GPU rerank → UMA collaboration
 
 Chimera+ replaces only the CPU full-bit document scorer in the accepted ARM Chimera baseline with a CUDA scorer. Routing, candidate generation/refinement, 1bit scoring, chunk selection and the final CPU heap are unchanged. The existing index is loaded without conversion or rebuilding.
 
@@ -23,7 +23,7 @@ The four frozen LoTTE configurations (CPU20, chunks1) remain:
 | 100 | .90 | 64 | 3000 | 300 | 96 |
 | 100 | .95 | 256 | 3000 | 300 | 288 |
 
-The single experiment report remains `/home/lxq/multi-vector-research/reports/lotte-r10-brief.md`.
+The main experiment report is `/home/lxq/multi-vector-research/reports/performance.md`.
 
 ## Multi-stream batch search
 
@@ -93,86 +93,59 @@ The fixed-B32 full-query comparison and bottleneck evidence are in
 pressure programs are maintained in `systems/chimera/bottleneck/` in the
 research repository.
 
-### Optional UMA paths and independent GPU kernels
+### Three selectable evolution stages
 
-The default path uses the original GPU routing/candidate/refinement/1bit kernels and the Chimera+ fullbit scorer. All switches below are opt-in and fixed when the index is loaded. Multi-stream workers inherit the owner's configuration and share its read-only corpus.
+Use one stage preset in `batch_search_benchmark`:
 
-| SearchOptions field | Batch CLI | Default | Work moved or storage changed |
+| Stage | Document reduction | Fullbit scoring | CPU organization |
 |---|---|---|---|
-| `uma_query_buffers` | `--uma-query-buffers` | `false` | ATS query/metadata buffers; CPU integer candidate-count and refined-length prefixes |
-| `uma_cpu_candidates` | `--uma-cpu-candidates` | `false` | CPU bitmap mark/count/prefix/materialization after CAGRA publishes labels into ATS |
-| `uma_cpu_refine` | `--uma-cpu-refine` | `false` | CPU exact stable-radix-equivalent Top-k after the unchanged GPU partial-score sum |
-| `uma_cpu_document` | `--uma-cpu-document` | `false` | Shared CPU pool reduces the GPU's 1bit token scores through ATS |
-| `uma_cpu_fullbit_fraction` | `--uma-cpu-fullbit-fraction F` | `0` | Shared CPU pool scores a suffix of fullbit candidates; GPU scores the rest |
-| `uma_cpu_fullbit_deferred` | `--uma-cpu-fullbit-deferred` | `false` | With fraction1/chunks1, batch lanes advance before CPU fullbit tails complete |
-| `cagra_memory_placement` | `--cagra-memory device\|ats-dataset\|ats-both` | `Device` / `device` | CAGRA dataset, or dataset and graph, in CPU-owned ATS storage |
-| `fast_document_reduce` | `--fast-document-reduce` | `false` | Four-warp GPU document reduction |
-| `compact_token_score` | `--compact-token-score` | `false` | GPU token scoring with bounded live accumulators |
+| `--stage chimera-batch` | Original GPU kernel | Original CPU implementation | Native B1 OpenMP20; batch outer4, serial inner scorer |
+| `--stage gpu-rerank` | Original GPU kernel | GPU | Four batch submitters, CPU20 allowed |
+| `--stage uma-collab` | Shared CPU pool | Deferred CPU pool jobs | Four P-core submitters + remaining16-core pool |
 
-The two GPU kernel switches are independent of UMA. Attribute UMA gains using the same GPU kernels, batch size, worker count and search parameters in both arms. Report GPU kernel gains separately.
+Named stages reject compact-token / fast-document GPU kernels, UMA small
+query/candidate/refinement buffers and CAGRA ATS placement. They also reject
+individual CPU backend/pool switches. Quality parameters remain caller-controlled.
+Use the same four quality configurations above to compare these stages.
+The main report records native B1 call latency and B32/W4 throughput separately.
 
-#### Shared CPU task pool
-
-CPU document/fullbit modes share one persistent pool across all query lanes.
-`--uma-cpu-threads N` defaults to ten E cores; `--uma-cpu-pool-cpus CSV` accepts
-an explicit list of up to sixteen CPUs. Set the submitters' affinity separately
-and use disjoint cores. The pool reads the existing corpus and token-score
-storage directly; there is no deliberate memory-read throttle.
-
-CPU document mode allocates a 2MiB-aligned ATS token-score matrix. The original
-GPU token scorer writes it; after its completion event, pool tasks calculate
-document scores using the original FP32 addition tree. The GPU document kernel
-is retained as a bitwise qualification oracle under `--verify-full-bit`.
-
-Fullbit fraction mode submits CPU suffix candidates before the unchanged GPU
-scorer handles the prefix, then joins before selection. Deferred mode instead
-owns each query's rotated vectors, candidate IDs and results until CPU scoring
-finishes. Lanes can reuse their GPU workspaces for later queries; the batch
-joins every tail before returning, including error cleanup. Ordinary B1 search
-keeps synchronous completion. GPU and original CPU oracles qualify its scores.
-
-#### CPU collaboration through ATS
-
-`uma_query_buffers` requires CUDA pageable-memory access using host page tables. Every lane owns its query, offsets and result metadata once; device pointers alias the same CPU allocations. GPU token-score storage remains device-allocated. CPU reads follow the corresponding stream/event completion; CPU writes precede dependent GPU launches.
-
-`uma_cpu_candidates` requires `uma_query_buffers`. It reads completed route labels and a shared corpus document-ID array, builds the candidate bitmap and emits IDs in ascending row order. Initialization replaces the corpus document-ID allocation with one CPU-owned ATS allocation; workers borrow that owner. The CLI enables its buffer prerequisite automatically.
-
-`uma_cpu_refine` requires both previous switches and candidate refinement. The unchanged GPU partial-score sum writes ATS scores. CPU precomputes packed64 radix keys, selects Top-k and sorts the selected prefix. The key includes the original row tie-break, preserving stable radix ordering, equivalent signed zeros and NaN bit ordering. Selected IDs already reside on CPU, so CPU also derives document offsets directly; token-position gathering remains on GPU. The CLI enables both prerequisites automatically. Library callers set them explicitly:
-
-```cpp
-SearchOptions options;
-options.uma_query_buffers = true;
-options.uma_cpu_candidates = true;
-options.uma_cpu_refine = true;
-index.load(index_path, options, load_options);
+```sh
+# After acquiring the global device lock; hold it through process teardown.
+taskset -c 8,9,18,19 ./batch_search_benchmark \
+  --stage uma-collab --index INDEX --queries queries.bin --output uma.json \
+  --workers 4 --batch-size 32 --rounds 4 --query-repeats 2 \
+  --nprobe 256 --k-refine 3000 --k-full-bit 300 --itopk 288 --topk 100
 ```
 
-`--verify-full-bit` additionally compares CPU candidate arrays and CPU Top-k IDs/score bits against their original GPU counterparts when those paths are enabled. It also retains the fullbit CPU/GPU score check and the fast-document-reduction check. Run it for qualification, then disable it for throughput.
+`apply_evolution_stage` in `cpp/include/chimera/evolution_stage.hpp` also
+provides these backend presets to C++ callers. Set the submitter affinity and
+OpenMP policy outside the library. The UMA preset assigns the persistent pool
+to `0..7,10..17`; submitters use `8,9,18,19`.
 
-#### CAGRA memory placement
+### CPU collaboration
 
-`--cagra-memory ats-dataset` keeps the graph on device and exposes the unchanged FP32 centroid dataset through ATS. `ats-both` exposes both arrays through ATS using a non-owning CAGRA view. Initialization copies the original bytes once and releases the replaced device owners; query-time corpus copies are zero. Search kernels, metric and routing parameters stay the same.
+One persistent task pool is shared by all query lanes. The original GPU token
+scorer writes a CPU-owned, 2MiB-aligned ATS score matrix. After its completion
+event, CPU tasks reduce documents using the original FP32 addition tree.
+CPU fullbit jobs read the existing 4bit corpus and factors directly, own their
+query/candidate/result storage and overlap with later queries on the GPU.
+Every job joins before batch return, including failure cleanup. Native B1 keeps
+synchronous completion. There is no deliberate memory-read throttle.
 
-The backing allocations are 2MiB-aligned and request `MADV_HUGEPAGE`. Actual huge-page coverage is recorded separately from `/proc/PID/smaps`. The owning `PG_CAGRA` outlives every worker; its view is destroyed before the ATS backing allocations. This placement can be tested independently of the CPU-collaboration switches.
+`--verify-full-bit` qualifies CPU document scores and fullbit scores bitwise
+against original CPU/GPU scorers; the original CPU stage is checked against
+the GPU oracle as well. Disable verification during performance measurement.
 
-#### Interpretation of current results
+Prior R100 .95 confirmation measured 424.9→479.7 QPS (+12.9%), holding the
+original GPU kernels and submitter cores fixed. Six scored rounds were
+477.79–480.77 QPS with actual recall about .9529. R10 .90 was approximately
+flat; the main report measures every requested quality point.
 
-With the original GPU scoring kernels unchanged, R100 .95 measured 424.9 QPS
-for the matched GPU-only control and 479.7 QPS with CPU document reduction plus
-deferred CPU fullbit tails (+12.9%). Six scored rounds from two independent
-confirmations are 477.79–480.77 QPS; even the slowest exceeds the strongest
-measured original-kernel GPU round by 11.60%. Each round exceeds twelve seconds,
-and full returned-ID recall passes .95. This is a UMA CPU-collaboration result;
-GPU compact-token/fast-document switches remain false in both arms.
+### Archived side experiments
 
-R10 .90 does not show a material gain from this preset; retain the default GPU
-path there. Parameters, figures, CPU scheduling overlap and independent audits
-are maintained in `reports/chimera-batch-search.md` in the research repository.
-The earlier same-new-kernel W8 UMA-buffer-only result was approximately 1.5%
-and is retained separately as historical evidence.
-
-`--query-repeats N` runs N complete passes continuously per round, including
-each pass's tail batch. Output records distinct/total query counts and preserves
-pass/query order. Increase N until every scored round exceeds six seconds.
-`token_score_qualification` compares original/compact GPU scores bitwise on
-192 generated cases and reports theoretical residency limits.
+The `archive/side-optimizations-20261115` branch retains the complete earlier
+GPU-kernel and UMA-buffer exploration with its documentation. Legacy switches
+remain opt-in under `--stage custom` for compatibility; all are disabled in
+the three named stages. Their gains are kept outside the UMA collaboration
+comparison. The research repository tracks the snapshot in
+`configs/performance-stages.json`.

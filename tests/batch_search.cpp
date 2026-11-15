@@ -1,4 +1,5 @@
 #include "chimera/chimera_index.cuh"
+#include "chimera/evolution_stage.hpp"
 #include "chimera/config.cuh"
 #include "chimera/profiling.hpp"
 #include "chimera/io.hpp"
@@ -78,24 +79,37 @@ int main(int argc,char** argv) try {
     size_t batch=32, rounds=3, limit=0, k=10, query_repeats=1;
     bool batch_only=false, profile_range=false;
     std::string cagra_memory="device";
+    std::string stage_name="custom";
+    bool custom_backend_switch=false, explicit_workers=false;
     Chimera::SearchOptions options;
     options.nprobe=32; options.k_refine=1000; options.k_full_bit=20;
     options.cagra_itopk_size=64; options.num_chunks=1;
     for(int i=1;i<argc;++i) {
         std::string arg=argv[i];
-        if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;continue; }
+        if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;custom_backend_switch=true;continue; }
         if(arg=="--compact-token-score") { options.compact_token_score=true;continue; }
         if(arg=="--fast-document-reduce") { options.fast_document_reduce=true;continue; }
         if(arg=="--uma-cpu-refine") { options.uma_cpu_refine=true; options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
         if(arg=="--uma-cpu-candidates") { options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
         if(arg=="--uma-query-buffers") { options.uma_query_buffers=true;continue; }
-        if(arg=="--uma-cpu-document") { options.uma_cpu_document=true;continue; }
-        if(arg=="--uma-cpu-fullbit-deferred") { options.uma_cpu_fullbit_deferred=true; options.uma_cpu_fullbit_fraction=1.0;continue; }
+        if(arg=="--uma-cpu-document") { options.uma_cpu_document=true;custom_backend_switch=true;continue; }
+        if(arg=="--uma-cpu-fullbit-deferred") { options.uma_cpu_fullbit_deferred=true; options.uma_cpu_fullbit_fraction=1.0;custom_backend_switch=true;continue; }
         if(arg=="--verify-full-bit") { options.verify_full_bit=true;continue; }
         if(arg=="--batch-only") { batch_only=true;continue; }
         if(arg=="--profile-range") { profile_range=true;continue; }
         if(arg=="--help") {
-            std::cout << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json [--workers 1,2,4,8,10 --batch-size 32 --rounds 3 --query-repeats 1 --compact-token-score --fast-document-reduce --uma-query-buffers --uma-cpu-candidates --uma-cpu-refine --uma-cpu-document --uma-cpu-fullbit-deferred --uma-cpu-fullbit-fraction 0.25 --uma-cpu-threads 10 --uma-cpu-pool-cpus 0,10,1,11,2,12,3,13,4,14 --cagra-memory device|ats-dataset|ats-both --verify-full-bit --limit N --topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64 --cpu-full-bit --batch-only --profile-range]\n";
+            std::cout
+                << "batch_search_benchmark --index DIR --queries FILE.npy|FILE.bin --output FILE.json\n"
+                << "  --stage chimera-batch|gpu-rerank|uma-collab\n"
+                << "    chimera-batch: original CPU fullbit + batch adaptation\n"
+                << "    gpu-rerank:   move fullbit to GPU, original 1bit kernels\n"
+                << "    uma-collab:   CPU document reduction + deferred CPU fullbit, 16-worker pool\n"
+                << "  [--workers 4 --batch-size 32 --rounds 4 --query-repeats 1]\n"
+                << "  [--topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64]\n"
+                << "  [--verify-full-bit --limit N --batch-only --profile-range]\n"
+                << "Native B1 and batch are both measured unless --batch-only is selected.\n"
+                << "Named stages exclude archived GPU-kernel and UMA-buffer experiments.\n"
+                << "Legacy individual backend/experimental switches remain available with --stage custom (default).\n";
             return 0;
         }
         if(++i>=argc)throw std::invalid_argument("Missing value for "+arg);
@@ -103,7 +117,8 @@ int main(int argc,char** argv) try {
         if(arg=="--index")index_path=value;
         else if(arg=="--queries")query_path=value;
         else if(arg=="--output")output_path=value;
-        else if(arg=="--workers")worker_list=value;
+        else if(arg=="--workers") { worker_list=value;explicit_workers=true; }
+        else if(arg=="--stage")stage_name=value;
         else if(arg=="--cagra-memory") {
             cagra_memory=value;
             if(value=="device") options.cagra_memory_placement=Chimera::CagraMemoryPlacement::Device;
@@ -120,10 +135,16 @@ int main(int argc,char** argv) try {
         else if(arg=="--k-refine")options.k_refine=std::stoi(value);
         else if(arg=="--k-full-bit")options.k_full_bit=std::stoi(value);
         else if(arg=="--itopk")options.cagra_itopk_size=std::stoi(value);
-        else if(arg=="--uma-cpu-fullbit-fraction")options.uma_cpu_fullbit_fraction=std::stod(value);
-        else if(arg=="--uma-cpu-threads")options.uma_cpu_threads=std::stoi(value);
-        else if(arg=="--uma-cpu-pool-cpus")options.uma_cpu_pool_cpus=value;
+        else if(arg=="--uma-cpu-fullbit-fraction") { options.uma_cpu_fullbit_fraction=std::stod(value);custom_backend_switch=true; }
+        else if(arg=="--uma-cpu-threads") { options.uma_cpu_threads=std::stoi(value);custom_backend_switch=true; }
+        else if(arg=="--uma-cpu-pool-cpus") { options.uma_cpu_pool_cpus=value;custom_backend_switch=true; }
         else throw std::invalid_argument("Unknown option "+arg);
+    }
+    const auto stage=Chimera::parse_evolution_stage(stage_name);
+    if(stage!=Chimera::EvolutionStage::Custom) {
+        if(custom_backend_switch)throw std::invalid_argument("Do not mix --stage with custom CPU backend/pool switches");
+        Chimera::apply_evolution_stage(stage,options);
+        if(!explicit_workers)worker_list="4";
     }
     if(index_path.empty()||query_path.empty()||output_path.empty()||!batch||!rounds||!k||!query_repeats)
         throw std::invalid_argument("Require index, queries, output, positive batch/rounds/topk/query-repeats");
@@ -165,7 +186,7 @@ int main(int argc,char** argv) try {
     const std::string partial_path=output_path+".partial";
     std::ofstream out(partial_path);
     if(!out)throw std::runtime_error("Cannot open output");
-    out << std::setprecision(12) << "{\"queries\":" << timed_queries
+    out << std::setprecision(12) << "{\"stage\":\""<<stage_name<<"\",\"queries\":" << timed_queries
         <<",\"distinct_queries\":"<<n<<",\"query_repeats\":"<<query_repeats
         << ",\"query_length\":"<<len
         <<",\"dimension\":"<<dim<<",\"topk\":"<<k<<",\"batch_size\":"<<batch

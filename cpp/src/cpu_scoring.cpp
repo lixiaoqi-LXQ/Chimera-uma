@@ -229,6 +229,18 @@ void chimera_index::compute_full_bit_scores(
     }
     compute_cpu_full_bit_scores(refined_doc_ids, full_bit_candidate_indices,
         num_full_bit_candidates, queries_flat, queries, full_bit_scores);
+    if (options_.verify_full_bit) {
+        std::vector<std::pair<float, int>> reference(num_full_bit_candidates);
+        compute_gpu_full_bit_scores(refined_doc_ids, full_bit_candidate_indices,
+            num_full_bit_candidates, queries, reference.data());
+        for (int i=0;i<num_full_bit_candidates;++i) {
+            if (reference[i].second!=full_bit_scores[i].second ||
+                std::memcmp(&reference[i].first,&full_bit_scores[i].first,sizeof(float)))
+                throw std::runtime_error("Original CPU fullbit differs from GPU oracle at candidate " + std::to_string(i));
+        }
+        std::cout << "[CPU_FULLBIT_VERIFY] candidates="<<num_full_bit_candidates
+                  <<" gpu_oracle_fp32_bitwise=passed\n";
+    }
 }
 
 void chimera_index::compute_cpu_full_bit_scores(
