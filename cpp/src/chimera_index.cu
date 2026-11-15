@@ -290,16 +290,10 @@ void chimera_index::initialize_search_state() {
         throw std::runtime_error("Invalid in-memory clustered index payload");
     }
 
-    size_t free_mem = 0;
-    [[maybe_unused]] size_t total_mem = 0;
-    check_cuda(cudaMemGetInfo(&free_mem, &total_mem));
-    if (free_mem <= expected_clustered_bytes) {
-        throw std::runtime_error(
-            "Insufficient GPU memory for clustered index: need " +
-            std::to_string(expected_clustered_bytes) + " bytes, have " +
-            std::to_string(free_mem) + " bytes free");
-    }
-
+    // On UMA, cudaMemGetInfo excludes reclaimable OS page cache and can
+    // underreport allocatable memory. Let the checked allocations decide;
+    // initialize_search_state's caller releases partial allocations on error.
+    // https://nvidia.custhelp.com/app/answers/detail/a_id/5728
     check_cuda(cudaMalloc(&d_clustered_one_bit_codes_, n * code_per_vec));
     check_cuda(cudaMalloc(&d_clustered_one_bit_factors_, n * sizeof(float)));
     check_cuda(cudaMalloc(&d_clustered_doc_ids_, n * sizeof(int)));
