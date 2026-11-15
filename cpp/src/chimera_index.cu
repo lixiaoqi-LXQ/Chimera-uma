@@ -37,6 +37,9 @@
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    if (options.shared_onebit_base_pages &&
+        !options.shared_onebit_corpus && !options.uma_cpu_onebit_fused)
+        throw std::invalid_argument("Shared onebit base-page control requires shared corpus or CPU onebit fused");
     if (options.uma_cpu_onebit_fused && (options.num_chunks != 1 || options.uma_cpu_document ||
         options.compact_token_score || options.fast_document_reduce || options.uma_query_buffers ||
         options.uma_cpu_candidates || options.uma_cpu_refine))
@@ -430,8 +433,9 @@ void chimera_index::initialize_search_state() {
             void* raw=nullptr;
             if (posix_memalign(&raw,page,rounded)) throw std::bad_alloc();
             std::unique_ptr<void, decltype(&std::free)> guard(raw,&std::free);
-            if (madvise(raw,rounded,MADV_HUGEPAGE))
-                throw std::runtime_error("Shared onebit corpus MADV_HUGEPAGE failed");
+            const int page_advice = options_.shared_onebit_base_pages ? MADV_NOHUGEPAGE : MADV_HUGEPAGE;
+            if (madvise(raw,rounded,page_advice))
+                throw std::runtime_error("Shared onebit corpus page-policy madvise failed");
             std::memset(raw,0,rounded);
             check_cuda(cudaMemcpy(raw,device_ptr,bytes,cudaMemcpyDeviceToHost));
             check_cuda(cudaFree(device_ptr));
@@ -440,7 +444,9 @@ void chimera_index::initialize_search_state() {
             std::cout << "[SHARED_ONEBIT_CORPUS] name=" << name << " cpu_ptr=" << raw
                       << " gpu_ptr=" << static_cast<const void*>(device_ptr)
                       << " bytes=" << bytes << " allocated_bytes=" << rounded
-                      << " thp_requested=1 alignment=" << page << " same_allocation=1\n";
+                      << " thp_requested=" << (options_.shared_onebit_base_pages ? 0 : 1)
+                      << " page_policy=" << (options_.shared_onebit_base_pages ? "base-pages" : "hugepage")
+                      << " alignment=" << page << " same_allocation=1\n";
         };
         migrate(d_clustered_one_bit_codes_,h_shared_onebit_codes_,n*code_per_vec,"codes");
         migrate(d_clustered_one_bit_factors_,h_shared_onebit_factors_,n*sizeof(float),"factors");
