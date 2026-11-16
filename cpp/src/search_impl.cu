@@ -16,6 +16,7 @@
 #include "chimera/cpu_refine_topk.hpp"
 #include "chimera/profiling.hpp"
 #include "chimera/ivf_pg.hpp"
+#include "chimera/cagra_half.hpp"
 #include "chimera/kernels.cuh"
 #include "chimera_index_internal.cuh"
 #include "doc_order_onebit.cuh"
@@ -102,6 +103,11 @@ std::vector<size_t> chimera_index::search_one(const float* queries, size_t k) {
     for (size_t i = 0; i < Q_DOCLEN; ++i) {
         rotator_->rotate(&queries[i * d], &ws_->h_pinned_queries[i * PADDED_DIM]);
     }
+
+    if (options_.cagra_half &&
+        !prepare_cagra_half_queries(ws_->h_pinned_queries, ws_->h_cagra_half_queries,
+                                    size_t(Q_DOCLEN) * PADDED_DIM))
+        throw std::invalid_argument("CAGRA half rotated queries must be finite and within [-65504,65504]");
 
     if (options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPadded &&
         !tensor_token_document_detail::half_query_domain_valid(ws_->h_pinned_queries))
@@ -190,7 +196,8 @@ void chimera_index::generate_and_refine_candidates(
         static_cast<size_t>(options_.cagra_team_size),
         static_cast<size_t>(options_.cagra_thread_block_size),
         static_cast<size_t>(options_.cagra_search_width),
-        static_cast<size_t>(options_.cagra_hashmap_min_bitlen));
+        static_cast<size_t>(options_.cagra_hashmap_min_bitlen),
+        ws_->d_cagra_half_queries);
     }
     }
 

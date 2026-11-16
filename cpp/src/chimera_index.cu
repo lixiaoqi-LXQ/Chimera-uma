@@ -37,6 +37,10 @@
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    if (options.cagra_half &&
+        (!options.uma_query_buffers || uses_flat_centroid_route(options.algorithm_variant) ||
+         options.cagra_memory_placement != CagraMemoryPlacement::Device))
+        throw std::invalid_argument("CAGRA half requires the CAGRA device graph route and UMA query buffers (custom experiment)");
     if (options.fused_direct_docs &&
         (!options.fused_token_document || !options.doc_order_onebit || !options.uma_query_buffers ||
          options.num_chunks != 1 || options.uma_cpu_refine ||
@@ -158,6 +162,22 @@ void chimera_index::validate_search_options(const SearchOptions& options) {
 }
 
 chimera_index::chimera_index() = default;
+
+CagraRouteStorageStats chimera_index::cagra_route_storage_stats() const {
+    const auto& owner = corpus();
+    if (!owner.has_index_ || !owner.ivf || !owner.ivf->pg_index || !ws_)
+        throw std::logic_error("CAGRA routing storage requires a prepared index");
+    auto stats = owner.ivf->pg_index->route_storage_stats();
+    if (stats.half_enabled != options_.cagra_half)
+        throw std::logic_error("CAGRA half runtime state differs from requested precision");
+    stats.half_query_bytes_per_lane = ws_->cagra_half_query_bytes;
+    if (stats.half_enabled &&
+        (!ws_->h_cagra_half_queries ||
+         ws_->h_cagra_half_queries != ws_->d_cagra_half_queries ||
+         stats.half_query_bytes_per_lane != size_t(Q_DOCLEN) * PADDED_DIM * sizeof(__half)))
+        throw std::logic_error("CAGRA half query owner/view invariant failed");
+    return stats;
+}
 
 ReadOnlyFullbitCodesView chimera_index::borrow_fullbit_codes() const {
     const auto& owner = corpus();
@@ -491,6 +511,8 @@ void chimera_index::initialize_search_state() {
     if (options_.cagra_memory_placement != CagraMemoryPlacement::Device)
         ivf->pg_index->place_in_ats_hugepages(
             options_.cagra_memory_placement == CagraMemoryPlacement::AtsDatasetAndGraph);
+    if (options_.cagra_half)
+        ivf->pg_index->enable_half_dataset();
     compute_candidate_bounds();
     allocate_workspace();
     if (options_.uma_cpu_candidates) {
@@ -579,6 +601,8 @@ void chimera_index::prepare_batch(size_t workers) {
         worker->ws_ = std::make_unique<Workspace>();
         worker->has_index_ = true;
         worker->allocate_workspace();
+        if (options_.cagra_half && worker->ws_->h_cagra_half_queries == ws_->h_cagra_half_queries)
+            throw std::logic_error("CAGRA half query buffers must be private to each lane");
         worker->search_ready_ = true;
         batch_workers_.push_back(std::move(worker));
     }

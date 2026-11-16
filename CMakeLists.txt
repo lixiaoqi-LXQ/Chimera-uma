@@ -57,6 +57,7 @@ add_library(chimera_core STATIC
     cpp/src/chimera_index.cu
     cpp/src/io.cpp
     cpp/src/fp16_input.cpp
+    cpp/src/cagra_half.cu
     cpp/src/ivf_pg.cpp
     cpp/src/kernels.cu
     cpp/src/quantization.cpp

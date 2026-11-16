@@ -1,4 +1,5 @@
 #include "chimera/ivf_pg.hpp"
+#include "chimera/cagra_half.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -51,6 +52,8 @@ PG_CAGRA::PG_CAGRA(size_t n, size_t d) : n(n), d(d) {}
 void PG_CAGRA::build_index(const float* data) {
     if (d == 0 || n > std::numeric_limits<size_t>::max() / d / sizeof(float))
         throw std::invalid_argument("Explicit centroid dataset size overflow");
+    index_cagra_half_.reset();
+    half_dataset_.reset();
     index_cagra.reset();
     explicit_dataset_.reset();
     ats_dataset_.reset();
@@ -72,7 +75,7 @@ void PG_CAGRA::build_index(const float* data) {
 
 
 void PG_CAGRA::place_in_ats_hugepages(bool include_graph) {
-    if (!index_cagra || ats_dataset_ || ats_graph_)
+    if (!index_cagra || ats_dataset_ || ats_graph_ || index_cagra_half_)
         throw std::logic_error("CAGRA ATS placement requires a fresh loaded index");
     int device = 0, pageable = 0, host_tables = 0;
     route_cuda(cudaGetDevice(&device), "CAGRA ATS device");
@@ -149,6 +152,101 @@ void PG_CAGRA::place_in_ats_hugepages(bool include_graph) {
               << " per_query_corpus_copy_bytes=0" << std::endl;
 }
 
+void PG_CAGRA::enable_half_dataset() {
+    if (!index_cagra || index_cagra_half_ || half_dataset_ || ats_dataset_ || ats_graph_)
+        throw std::logic_error("CAGRA half initialization requires a fresh device FP32 index");
+    const auto data = index_cagra->dataset();
+    const auto graph = index_cagra->graph();
+    if (!n || d != 128 || n > size_t(std::numeric_limits<uint32_t>::max()) ||
+        index_cagra->metric() != cuvs::distance::DistanceType::L2Expanded ||
+        data.extent(0) != static_cast<int64_t>(n) ||
+        data.extent(1) != static_cast<int64_t>(d) ||
+        data.stride(0) != static_cast<int64_t>(d) || data.stride(1) != 1 ||
+        !data.data_handle() || graph.extent(0) != static_cast<int64_t>(n) ||
+        graph.extent(1) <= 0 || !graph.data_handle() ||
+        index_cagra->source_indices().has_value() ||
+        index_cagra->dataset_fd().has_value() || index_cagra->graph_fd().has_value() ||
+        index_cagra->mapping_fd().has_value())
+        throw std::invalid_argument("CAGRA half requires original dense FP32 D128 L2 graph/data without remapping");
+    const size_t degree = static_cast<size_t>(graph.extent(1));
+    if (n > std::numeric_limits<size_t>::max() / d / sizeof(float) ||
+        n > std::numeric_limits<size_t>::max() / degree / sizeof(uint32_t))
+        throw std::overflow_error("CAGRA half payload size overflow");
+
+    // Complete deserialize before the conversion. The helper drains this same
+    // stream on success/error, so the local owner is always safe to release.
+    raft::resource::sync_stream(res_);
+    __half* raw = nullptr;
+    route_cuda(cudaMalloc(reinterpret_cast<void**>(&raw), n * d * sizeof(__half)),
+               "Allocate CAGRA half dataset");
+    std::unique_ptr<__half, FreeHalfDataset> half_owner(raw);
+    initialize_cagra_half_dataset(data.data_handle(), half_owner.get(), n * d,
+                                  raft::resource::get_cuda_stream(res_));
+
+    auto half_index = std::make_unique<cuvs::neighbors::cagra::index<__half, uint32_t>>(
+        res_, index_cagra->metric());
+    // Explicit non-owning wrapper: no pointer-classification copy or second
+    // half allocation. Original float index continues to own the exact graph.
+    auto dataset = std::make_unique<cuvs::neighbors::non_owning_dataset<__half, int64_t>>(
+        raft::make_device_strided_matrix_view<const __half, int64_t>(
+            half_owner.get(), n, d, d));
+    half_index->update_dataset(res_, std::move(dataset));
+    half_index->update_graph(res_, graph);
+    if (half_index->dataset().data_handle() != half_owner.get() ||
+        half_index->data().is_owning() ||
+        half_index->graph().data_handle() != graph.data_handle() ||
+        half_index->size() != index_cagra->size() ||
+        half_index->dim() != index_cagra->dim() ||
+        half_index->graph_degree() != index_cagra->graph_degree())
+        throw std::runtime_error("CAGRA half dataset/graph alias or shape mismatch");
+    raft::resource::sync_stream(res_);
+    half_dataset_ = std::move(half_owner);
+    index_cagra_half_ = std::move(half_index);
+
+    const auto stats = route_storage_stats();
+    std::cout << "[CAGRA_HALF] enabled=1 dataset_dtype=fp16 query_dtype=fp16"
+              << " distance_output_dtype=fp32 route_math=cuvs-native"
+              << " rows=" << n << " dimension=" << d << " graph_degree=" << degree
+              << " half_dataset_ptr=" << static_cast<const void*>(half_dataset_.get())
+              << " source_float_dataset_ptr=" << static_cast<const void*>(data.data_handle())
+              << " graph_ptr=" << static_cast<const void*>(graph.data_handle())
+              << " dataset_alias_verified=1 graph_alias_verified=1"
+              << " source_float_dataset_retained=1 graph_rebuilt=0 graph_copy_bytes=0"
+              << " source_float_dataset_bytes=" << stats.source_float_dataset_bytes
+              << " half_dataset_bytes=" << stats.half_dataset_bytes
+              << " graph_bytes=" << stats.graph_bytes
+              << " conversion=round-nearest-even domain_all_elements_checked=1"
+              << " initialization_complete=1" << std::endl;
+}
+
+CagraRouteStorageStats PG_CAGRA::route_storage_stats() const {
+    CagraRouteStorageStats stats;
+    if (!index_cagra) return stats;
+    stats.rows = static_cast<size_t>(index_cagra->size());
+    stats.dimension = index_cagra->dim();
+    stats.graph_degree = index_cagra->graph_degree();
+    if (!stats.dimension || !stats.graph_degree ||
+        stats.rows > std::numeric_limits<size_t>::max() / stats.dimension / sizeof(float) ||
+        stats.rows > std::numeric_limits<size_t>::max() / stats.graph_degree / sizeof(uint32_t))
+        throw std::overflow_error("CAGRA routing storage size overflow");
+    stats.source_float_dataset_bytes = stats.rows * stats.dimension * sizeof(float);
+    stats.graph_bytes = stats.rows * stats.graph_degree * sizeof(uint32_t);
+    stats.source_float_dataset_retained = index_cagra->dataset().data_handle() != nullptr;
+    stats.half_enabled = static_cast<bool>(index_cagra_half_);
+    if (stats.half_enabled) {
+        stats.half_dataset_bytes = stats.rows * stats.dimension * sizeof(__half);
+        stats.dataset_alias_verified = half_dataset_ &&
+            index_cagra_half_->dataset().data_handle() == half_dataset_.get() &&
+            !index_cagra_half_->data().is_owning();
+        stats.graph_alias_verified = index_cagra_half_->graph().data_handle() ==
+            index_cagra->graph().data_handle();
+        if (!stats.dataset_alias_verified || !stats.graph_alias_verified ||
+            !stats.source_float_dataset_retained)
+            throw std::logic_error("CAGRA half owner/view invariant failed");
+    }
+    return stats;
+}
+
 void PG_CAGRA::search_centroids(
     const float* d_queries,
     size_t n_queries,
@@ -161,11 +259,12 @@ void PG_CAGRA::search_centroids(
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
     size_t cagra_search_width,
-    size_t cagra_hashmap_min_bitlen) {
+    size_t cagra_hashmap_min_bitlen,
+    const __half* d_half_queries) {
     search_centroids(
         res_, d_queries, n_queries, nprobe, d_dists, d_labels, stream,
         cagra_itopk_size, cagra_algo, cagra_team_size,
-        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen);
+        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen, d_half_queries);
 }
 
 void PG_CAGRA::search_centroids(
@@ -181,10 +280,13 @@ void PG_CAGRA::search_centroids(
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
     size_t cagra_search_width,
-    size_t cagra_hashmap_min_bitlen) {
+    size_t cagra_hashmap_min_bitlen,
+    const __half* d_half_queries) {
     if (cagra_hashmap_min_bitlen != 0 &&
         (cagra_hashmap_min_bitlen < 8 || cagra_hashmap_min_bitlen > 20))
         throw std::invalid_argument("CAGRA hashmap minimum bit length must be 0 or 8..20");
+    if (static_cast<bool>(index_cagra_half_) != (d_half_queries != nullptr))
+        throw std::invalid_argument("CAGRA half index and half query must be enabled together");
     raft::resource::set_cuda_stream(res, rmm::cuda_stream_view(stream));
 
     auto queries = raft::make_device_matrix_view(
@@ -213,8 +315,15 @@ void PG_CAGRA::search_centroids(
     search_params.thread_block_size = cagra_thread_block_size;
     search_params.search_width = cagra_search_width;
     search_params.hashmap_min_bitlen = cagra_hashmap_min_bitlen;
-    cuvs::neighbors::cagra::search(
-        res, search_params, *index_cagra, queries, labels, distances);
+    if (index_cagra_half_) {
+        auto half_queries = raft::make_device_matrix_view<const __half, int64_t>(
+            d_half_queries, static_cast<int64_t>(n_queries), static_cast<int64_t>(d));
+        cuvs::neighbors::cagra::search(
+            res, search_params, *index_cagra_half_, half_queries, labels, distances);
+    } else {
+        cuvs::neighbors::cagra::search(
+            res, search_params, *index_cagra, queries, labels, distances);
+    }
 }
 
 void PG_CAGRA::save(const std::string& graph_path) const {
@@ -223,6 +332,8 @@ void PG_CAGRA::save(const std::string& graph_path) const {
 
 void PG_CAGRA::load(const std::string& graph_path) {
     // Destroy the old view before releasing its explicit backing allocation.
+    index_cagra_half_.reset();
+    half_dataset_.reset();
     index_cagra.reset();
     explicit_dataset_.reset();
     ats_dataset_.reset();
@@ -250,11 +361,12 @@ void IVF_PG::search_centroids(
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
     size_t cagra_search_width,
-    size_t cagra_hashmap_min_bitlen) {
+    size_t cagra_hashmap_min_bitlen,
+    const __half* d_half_queries) {
     pg_index->search_centroids(
         d_queries, n_queries, nprobe, d_dists, d_labels, stream,
         cagra_itopk_size, cagra_algo, cagra_team_size,
-        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen);
+        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen, d_half_queries);
 }
 
 void IVF_PG::search_centroids(
@@ -270,11 +382,12 @@ void IVF_PG::search_centroids(
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
     size_t cagra_search_width,
-    size_t cagra_hashmap_min_bitlen) {
+    size_t cagra_hashmap_min_bitlen,
+    const __half* d_half_queries) {
     pg_index->search_centroids(
         res, d_queries, n_queries, nprobe, d_dists, d_labels, stream,
         cagra_itopk_size, cagra_algo, cagra_team_size,
-        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen);
+        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen, d_half_queries);
 }
 
 void IVF_PG::build_from_assignments(const uint32_t* list_nos, size_t n_vectors) {

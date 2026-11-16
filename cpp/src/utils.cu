@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -407,6 +408,18 @@ void chimera_index::allocate_workspace() {
         check_cuda(cudaMalloc(&ws_->d_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
         check_cuda(cudaMalloc(&ws_->d_cb1_sumq, Q_DOCLEN * sizeof(float)));
     }
+    if (options_.cagra_half) {
+        if (!ws_->uma_query_buffers || PADDED_DIM != 128)
+            throw std::logic_error("CAGRA half queries require verified ATS and D128");
+        allocate_ats_buffer(ws_->h_cagra_half_queries, ws_->d_cagra_half_queries,
+                            size_t(Q_DOCLEN) * PADDED_DIM);
+        ws_->cagra_half_query_bytes = size_t(Q_DOCLEN) * PADDED_DIM * sizeof(__half);
+        std::cout << "[CAGRA_HALF_QUERY] lane_private=1 host_ptr="
+                  << static_cast<const void*>(ws_->h_cagra_half_queries)
+                  << " device_ptr=" << static_cast<const void*>(ws_->d_cagra_half_queries)
+                  << " ats_alias_verified=1 allocated_bytes=" << ws_->cagra_half_query_bytes
+                  << " alignment=256 conversion=cpu-rn-even per_query_host_sync=0" << std::endl;
+    }
     if (ws_->uma_query_buffers) {
         allocate_ats_buffer(ws_->h_refined_doc_lengths, ws_->d_refined_doc_lengths,
                             ws_->max_refined_candidates);
@@ -685,6 +698,7 @@ void chimera_index::release_resources() noexcept {
         (void)cudaFreeHost(ws_->h_tensor_half_reference);
         (void)cudaFree(ws_->d_tensor_half_bounds);
         (void)cudaFreeHost(ws_->h_tensor_half_bounds);
+        std::free(ws_->h_cagra_half_queries);
         if (!ws_->uma_query_buffers) {
             (void)cudaFree(ws_->d_queries);
             (void)cudaFree(ws_->d_cb1_sumq);

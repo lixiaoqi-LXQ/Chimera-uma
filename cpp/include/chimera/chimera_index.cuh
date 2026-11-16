@@ -94,6 +94,7 @@ struct SearchOptions {
     int cagra_thread_block_size = 0;
     int cagra_search_width = 1;
     int cagra_hashmap_min_bitlen = 0;  // Custom search: 0 keeps cuVS default; explicit 8..20 sets its lower bound.
+    bool cagra_half = false;  // Custom-only approximate FP16 dataset/query route; original graph/FP32 scoring remain.
     int num_chunks = 5;
     bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
@@ -135,6 +136,21 @@ struct QueryProfileStats {
     size_t refined_tokens = 0;
     size_t fullbit_candidates = 0;
     size_t fullbit_tokens = 0;
+};
+
+// Runtime routing storage, not an assertion about cuVS's internal arithmetic.
+struct CagraRouteStorageStats {
+    bool half_enabled = false;
+    bool dataset_alias_verified = false;
+    bool graph_alias_verified = false;
+    bool source_float_dataset_retained = false;
+    size_t rows = 0;
+    size_t dimension = 0;
+    size_t graph_degree = 0;
+    size_t source_float_dataset_bytes = 0;
+    size_t half_dataset_bytes = 0;
+    size_t graph_bytes = 0;
+    size_t half_query_bytes_per_lane = 0;
 };
 
 class chimera_index {
@@ -245,6 +261,7 @@ class chimera_index {
     }
     void set_capture_scores(bool enabled) { capture_scores_ = enabled; }
     const std::vector<float>& last_result_scores() const { return last_result_scores_; }
+    CagraRouteStorageStats cagra_route_storage_stats() const;
 
     void save(const std::string& index_dir) const;
     void load(

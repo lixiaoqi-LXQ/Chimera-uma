@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
 #include <cuvs/neighbors/cagra.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/host_mdspan.hpp>
@@ -29,12 +30,23 @@ struct PG_CAGRA {
     std::unique_ptr<void, FreeAts> ats_dataset_;
     std::unique_ptr<void, FreeAts> ats_graph_;
     std::unique_ptr<cuvs::neighbors::cagra::index<float, uint32_t>> index_cagra;
+    struct FreeHalfDataset {
+        void operator()(__half* ptr) const noexcept { if (ptr) (void)cudaFree(ptr); }
+    };
+    // Destruction order: half view, half dataset, original FP32 graph/data owner.
+    std::unique_ptr<__half, FreeHalfDataset> half_dataset_;
+    std::unique_ptr<cuvs::neighbors::cagra::index<__half, uint32_t>> index_cagra_half_;
 
     PG_CAGRA(size_t n, size_t d);
+    PG_CAGRA(const PG_CAGRA&) = delete;
+    PG_CAGRA& operator=(const PG_CAGRA&) = delete;
 
     void build_index(const float* data);
     // Initialization only; keeps data/graph bytes and search kernels unchanged.
     void place_in_ats_hugepages(bool include_graph);
+    // Initialization only; borrows the original graph and retains its owner.
+    void enable_half_dataset();
+    CagraRouteStorageStats route_storage_stats() const;
     void search_centroids(
         const float* d_queries,
         size_t n_queries,
@@ -47,7 +59,8 @@ struct PG_CAGRA {
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
         size_t cagra_search_width = 1,
-        size_t cagra_hashmap_min_bitlen = 0);
+        size_t cagra_hashmap_min_bitlen = 0,
+        const __half* d_half_queries = nullptr);
     void search_centroids(
         const raft::resources& res,
         const float* d_queries,
@@ -61,7 +74,8 @@ struct PG_CAGRA {
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
         size_t cagra_search_width = 1,
-        size_t cagra_hashmap_min_bitlen = 0);
+        size_t cagra_hashmap_min_bitlen = 0,
+        const __half* d_half_queries = nullptr);
     void save(const std::string& graph_path) const;
     void load(const std::string& graph_path);
 };
@@ -89,7 +103,8 @@ struct IVF_PG {
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
         size_t cagra_search_width = 1,
-        size_t cagra_hashmap_min_bitlen = 0);
+        size_t cagra_hashmap_min_bitlen = 0,
+        const __half* d_half_queries = nullptr);
     void search_centroids(
         const raft::resources& res,
         const float* d_queries,
@@ -103,7 +118,8 @@ struct IVF_PG {
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
         size_t cagra_search_width = 1,
-        size_t cagra_hashmap_min_bitlen = 0);
+        size_t cagra_hashmap_min_bitlen = 0,
+        const __half* d_half_queries = nullptr);
 
     void build_from_assignments(const uint32_t* list_nos, size_t n_vectors);
     int max_cluster_size() const;

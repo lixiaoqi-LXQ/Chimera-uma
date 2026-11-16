@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include "chimera/chimera_index.cuh"
 #include "chimera/flat_l2_router.cuh"
@@ -12,6 +13,9 @@
 namespace Chimera {
 
 struct chimera_index::Workspace {
+    Workspace() = default;
+    Workspace(const Workspace&) = delete;
+    Workspace& operator=(const Workspace&) = delete;
     // Actual enabled state; set only after verifying ATS/host-page-table access.
     bool uma_query_buffers = false;
     bool cpu_document_enabled = false;
@@ -36,6 +40,10 @@ struct chimera_index::Workspace {
     float* h_full_cbex = nullptr;
     float* h_full_scores = nullptr;
     float* d_queries = nullptr;
+    // Sole lane-local ATS owner is h_; d_ is the same address, never cudaFree'd.
+    __half* h_cagra_half_queries = nullptr;
+    __half* d_cagra_half_queries = nullptr;
+    size_t cagra_half_query_bytes = 0;
     float* d_cb1_sumq = nullptr;
     int* d_refined_doc_lengths = nullptr;
     float* d_one_bit_token_scores = nullptr;

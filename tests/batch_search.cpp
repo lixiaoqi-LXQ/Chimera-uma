@@ -87,6 +87,7 @@ int main(int argc,char** argv) try {
     for(int i=1;i<argc;++i) {
         std::string arg=argv[i];
         if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;custom_backend_switch=true;continue; }
+        if(arg=="--cagra-half") { options.cagra_half=true;custom_backend_switch=true;continue; }
         if(arg=="--doc-order-onebit") { options.doc_order_onebit=true;custom_backend_switch=true;continue; }
         if(arg=="--fused-token-document") { options.fused_token_document=true;custom_backend_switch=true;continue; }
         if(arg=="--fused-direct-docs") { options.fused_direct_docs=true;custom_backend_switch=true;continue; }
@@ -113,6 +114,7 @@ int main(int argc,char** argv) try {
                 << "  [--cagra-algo auto|single-cta|multi-cta|multi-kernel]\n"
                 << "  [--cagra-team-size 0|4|8|16|32 --cagra-thread-block-size 0|64|128|256|512|1024 --cagra-search-width N]\n"
                 << "  [--cagra-hashmap-min-bitlen 0|8..20] (custom stage only; 0 keeps cuVS default)\n"
+                << "  [--cagra-half] (custom stage, CAGRA device graph + UMA queries; FP16 routing inputs, unchanged original graph/FP32 fullbit)\n"
                 << "  [--split-token-score] (custom stage, excludes compact/fused/CPU document)\n"
                 << "  [--fused-token-document --fused-token-document-threads 128|256] (custom stage, chunks1)\n"
                 << "  [--fused-token-document-layout grouped|interleaved|cached|warp4doc|tensor-padded] (requires fused scoring; warp4doc/tensor-padded requires 128 threads)\n"
@@ -183,6 +185,13 @@ int main(int argc,char** argv) try {
         else throw std::invalid_argument("Unknown option "+arg);
     }
     // Reject invalid feature contracts before query-file reads/index loading.
+    if (options.cagra_half && stage_name != "custom")
+        throw std::invalid_argument("--cagra-half is a custom-stage precision experiment");
+    if (options.cagra_half &&
+        (!options.uma_query_buffers ||
+         options.cagra_memory_placement != Chimera::CagraMemoryPlacement::Device ||
+         Chimera::uses_flat_centroid_route(options.algorithm_variant)))
+        throw std::invalid_argument("--cagra-half requires --uma-query-buffers and the CAGRA device graph route");
     if (options.cagra_hashmap_min_bitlen != 0 &&
         (options.cagra_hashmap_min_bitlen < 8 || options.cagra_hashmap_min_bitlen > 20))
         throw std::invalid_argument("CAGRA hashmap minimum bit length must be 0 or 8..20");
@@ -239,6 +248,7 @@ int main(int argc,char** argv) try {
     Chimera::chimera_index index;
     Chimera::LoadOptions load; load.low_memory=true;
     index.load(index_path,options,load);
+    const auto cagra_storage = index.cagra_route_storage_stats();
     std::string pool_cpu_report = options.uma_cpu_pool_cpus;
     if (pool_cpu_report.empty()) {
         constexpr int efficiency_cpus[] = {0,10,1,11,2,12,3,13,4,14};
@@ -270,6 +280,24 @@ int main(int argc,char** argv) try {
         <<",\"cagra_thread_block_size\":"<<options.cagra_thread_block_size
         <<",\"cagra_search_width\":"<<options.cagra_search_width
         <<",\"cagra_hashmap_min_bitlen\":"<<options.cagra_hashmap_min_bitlen
+        <<",\"cagra_half\":"<<(cagra_storage.half_enabled?"true":"false")
+        <<",\"cagra_dataset_dtype\":\""<<(cagra_storage.half_enabled?"fp16":"fp32")<<"\""
+        <<",\"cagra_query_dtype\":\""<<(cagra_storage.half_enabled?"fp16":"fp32")<<"\""
+        <<",\"cagra_distance_output_dtype\":\"fp32\""
+        <<",\"cagra_route_math\":\""<<(cagra_storage.half_enabled?"fp16-input/cuvs-native":"fp32-input/cuvs-native")<<"\""
+        <<",\"cagra_input_rounding\":\""<<(cagra_storage.half_enabled?"rn-even":"none")<<"\""
+        <<",\"cagra_rows\":"<<cagra_storage.rows
+        <<",\"cagra_dimension\":"<<cagra_storage.dimension
+        <<",\"cagra_graph_degree\":"<<cagra_storage.graph_degree
+        <<",\"cagra_source_float_dataset_bytes\":"<<cagra_storage.source_float_dataset_bytes
+        <<",\"cagra_half_dataset_bytes\":"<<cagra_storage.half_dataset_bytes
+        <<",\"cagra_graph_bytes\":"<<cagra_storage.graph_bytes
+        <<",\"cagra_active_dataset_bytes\":"<<(cagra_storage.half_enabled?cagra_storage.half_dataset_bytes:cagra_storage.source_float_dataset_bytes)
+        <<",\"cagra_routing_resident_bytes\":"<<(cagra_storage.source_float_dataset_bytes+cagra_storage.half_dataset_bytes+cagra_storage.graph_bytes)
+        <<",\"cagra_half_query_bytes_per_lane\":"<<cagra_storage.half_query_bytes_per_lane
+        <<",\"cagra_dataset_alias_verified\":"<<(cagra_storage.dataset_alias_verified?"true":"false")
+        <<",\"cagra_graph_alias_verified\":"<<(cagra_storage.graph_alias_verified?"true":"false")
+        <<",\"cagra_source_float_dataset_retained\":"<<(cagra_storage.source_float_dataset_retained?"true":"false")
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
         <<",\"doc_order_onebit\":"<<(options.doc_order_onebit?"true":"false")
         <<",\"fused_token_document\":"<<(options.fused_token_document?"true":"false")
