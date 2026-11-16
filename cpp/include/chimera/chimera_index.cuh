@@ -69,13 +69,14 @@ inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == Algorithm
 enum class CagraMemoryPlacement { Device, AtsDataset, AtsDatasetAndGraph };
 // Existing cuVS search implementations; this only controls host dispatch.
 enum class CagraSearchAlgorithm { Auto = 100, SingleCta = 0, MultiCta = 1, MultiKernel = 2 };
-enum class FusedTokenDocumentLayout { Grouped, Interleaved, Cached, Warp4Doc };
+enum class FusedTokenDocumentLayout { Grouped, Interleaved, Cached, Warp4Doc, TensorPadded };
 inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout layout) {
     switch (layout) {
         case FusedTokenDocumentLayout::Grouped: return "grouped";
         case FusedTokenDocumentLayout::Interleaved: return "interleaved";
         case FusedTokenDocumentLayout::Cached: return "cached";
         case FusedTokenDocumentLayout::Warp4Doc: return "warp4doc";
+        case FusedTokenDocumentLayout::TensorPadded: return "tensor-padded";
         default: throw std::invalid_argument("Unknown fused token/document layout");
     }
 }
@@ -96,9 +97,9 @@ struct SearchOptions {
     bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
     bool doc_order_onebit = false;  // Optional document-order replica, built and verified once at load.
-    bool fused_token_document = false;  // Opt-in Q8 groups, small query-max scratch, then original-order sum.
-    bool fused_direct_docs = false;  // Grouped/warp4doc fusion reads natural doc ranges; bypass refined metadata handoff.
-    int fused_token_document_threads = 128;  // Supported CTA sizes: 128 or 256.
+    bool fused_token_document = false;  // Opt-in fusion; TensorPadded explicitly uses FP16 inputs, other layouts preserve FP32.
+    bool fused_direct_docs = false;  // Grouped/warp4doc/TensorPadded read natural doc ranges; bypass refined metadata handoff.
+    int fused_token_document_threads = 128;  // 128/256; warp4doc and TensorPadded require128.
     FusedTokenDocumentLayout fused_token_document_layout = FusedTokenDocumentLayout::Grouped;
     bool split_token_score = false;  // Opt-in independent Q8 CTA groups, original score matrix.
     bool compact_token_score = false;  // Independent opt-in bounded-register token scorer.

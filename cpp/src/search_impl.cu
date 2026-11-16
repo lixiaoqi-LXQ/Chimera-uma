@@ -20,6 +20,8 @@
 #include "chimera_index_internal.cuh"
 #include "doc_order_onebit.cuh"
 #include "fused_token_document.cuh"
+#include "tensor_token_document.cuh"
+#include "tensor_document_verification.hpp"
 #include "split_token_score.cuh"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
@@ -100,6 +102,10 @@ std::vector<size_t> chimera_index::search_one(const float* queries, size_t k) {
     for (size_t i = 0; i < Q_DOCLEN; ++i) {
         rotator_->rotate(&queries[i * d], &ws_->h_pinned_queries[i * PADDED_DIM]);
     }
+
+    if (options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPadded &&
+        !tensor_token_document_detail::half_query_domain_valid(ws_->h_pinned_queries))
+        throw std::invalid_argument("Tensor-padded rotated queries must be finite and within the FP16 range [-65504,65504]");
 
     query_states.resize(Q_DOCLEN);
     for (size_t i = 0; i < Q_DOCLEN; ++i) {
@@ -465,6 +471,7 @@ void chimera_index::collaborative_document_scoring(
     const int* refined_ids = options_.uma_cpu_refine
         ? ws_->h_refined_doc_ids : ws_->d_candidate_doc_ids;
     const bool direct_docs = options_.fused_direct_docs;
+    const bool tensor_layout = options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPadded;
     // The old metadata path is retained only for ordinary scoring or an
     // explicit original-kernel oracle. The primary direct kernel still runs
     // during verification; only its reference needs materialized positions.
@@ -624,7 +631,27 @@ void chimera_index::collaborative_document_scoring(
                 const size_t shared_bytes = options_.fused_token_document_layout == FusedTokenDocumentLayout::Warp4Doc
                     ? size_t(4104) * sizeof(float)
                     : (4104 + (threads / 32) * 8) * sizeof(float);
-                if (direct_docs) {
+                if (tensor_layout) {
+                    if (threads != 128 || !ws_->uma_query_buffers || !options_.doc_order_onebit)
+                        throw std::runtime_error("Tensor-padded launch contract differs");
+                    if (direct_docs) {
+                        if (!ws_->d_mapped_refined_doc_ids ||
+                            (collect_direct_lengths && (!ws_->d_refined_doc_lengths || !ws_->h_refined_doc_lengths)))
+                            throw std::runtime_error("Missing Tensor direct mapped metadata buffers");
+                        tensor_token_document_detail::tensor_token_document<true><<<chunk_count,128,0,stream>>>(
+                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                            nullptr, nullptr, refined_ids, d_doc_ptrs_,
+                            ws_->d_mapped_refined_doc_ids,
+                            collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
+                            ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                    } else {
+                        tensor_token_document_detail::tensor_token_document<false><<<chunk_count,128,0,stream>>>(
+                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                            ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                            nullptr, nullptr, nullptr, nullptr,
+                            ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                    }
+                } else if (direct_docs) {
                     if (!ws_->uma_query_buffers || !ws_->d_mapped_refined_doc_ids ||
                         (collect_direct_lengths && (!ws_->d_refined_doc_lengths || !ws_->h_refined_doc_lengths)))
                         throw std::runtime_error("Missing direct fusion mapped metadata buffers");
@@ -732,6 +759,29 @@ void chimera_index::collaborative_document_scoring(
                 if (options_.verify_full_bit) {
                     if (!ws_->d_document_reduce_reference || !ws_->h_document_reduce_reference)
                         throw std::runtime_error("Missing fused token/document oracle buffers");
+                    if (tensor_layout) {
+                        if (!ws_->d_tensor_querymax_capture || !ws_->h_tensor_querymax_capture ||
+                            !ws_->d_tensor_half_reference || !ws_->h_tensor_half_reference ||
+                            !ws_->d_tensor_half_bounds || !ws_->h_tensor_half_bounds)
+                            throw std::runtime_error("Missing private Tensor scalar-half oracle buffers");
+                        const size_t values = static_cast<size_t>(chunk_count) * Q_DOCLEN;
+                        // Preserve primary querymax before the original token
+                        // oracle overwrites the shared matrix/scratch allocation.
+                        check_cuda(cudaMemcpyAsync(ws_->d_tensor_querymax_capture, ws_->d_one_bit_token_scores,
+                                                   values*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                        tensor_half_oracle_detail::scalar_half_query_maxima_reference<<<chunk_count,32,0,stream>>>(
+                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                            ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                            ws_->d_tensor_half_reference, ws_->d_tensor_half_bounds,
+                            static_cast<size_t>(chunk_count));
+                        check_cuda(cudaGetLastError());
+                        check_cuda(cudaMemcpyAsync(ws_->h_tensor_querymax_capture, ws_->d_tensor_querymax_capture,
+                                                   values*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                        check_cuda(cudaMemcpyAsync(ws_->h_tensor_half_reference, ws_->d_tensor_half_reference,
+                                                   values*sizeof(double), cudaMemcpyDeviceToHost, stream));
+                        check_cuda(cudaMemcpyAsync(ws_->h_tensor_half_bounds, ws_->d_tensor_half_bounds,
+                                                   values*sizeof(double), cudaMemcpyDeviceToHost, stream));
+                    }
                     if (token_count > 0) {
                         const int token_blocks = static_cast<int>((token_count + 255) / 256);
                         const size_t reference_shared =
@@ -953,7 +1003,15 @@ void chimera_index::collaborative_document_scoring(
             group->wait();
         }
 
-        if ((options_.split_token_score || options_.fast_document_reduce || options_.fused_token_document ||
+        if (tensor_layout && options_.verify_full_bit && chunk_count > 0) {
+            std::cout << tensor_half_oracle_detail::verify_document_results(
+                ws_->h_tensor_querymax_capture, ws_->h_tensor_half_reference, ws_->h_tensor_half_bounds,
+                ws_->h_mapped_one_bit_document_scores, ws_->h_document_reduce_reference,
+                ws_->h_pinned_refined_doc_offsets, refined_doc_ids, static_cast<size_t>(chunk_count));
+        }
+
+        // Only the original FP32 math layouts claim bitwise original scores.
+        if (!tensor_layout && (options_.split_token_score || options_.fast_document_reduce || options_.fused_token_document ||
              ws_->cpu_document_enabled) && options_.verify_full_bit) {
             for (int i = chunk_start; i < chunk_end; ++i) {
                 if (std::memcmp(&ws_->h_document_reduce_reference[i],

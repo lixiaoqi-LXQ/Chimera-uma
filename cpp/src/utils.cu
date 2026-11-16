@@ -556,6 +556,17 @@ void chimera_index::allocate_workspace() {
                                   ws_->max_refined_candidates * sizeof(float)));
     }
 
+    if (options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPadded &&
+        options_.verify_full_bit) {
+        const size_t values = ws_->max_refined_candidates * static_cast<size_t>(Q_DOCLEN);
+        check_cuda(cudaMalloc(&ws_->d_tensor_querymax_capture, values * sizeof(float)));
+        check_cuda(cudaMallocHost(&ws_->h_tensor_querymax_capture, values * sizeof(float)));
+        check_cuda(cudaMalloc(&ws_->d_tensor_half_reference, values * sizeof(double)));
+        check_cuda(cudaMallocHost(&ws_->h_tensor_half_reference, values * sizeof(double)));
+        check_cuda(cudaMalloc(&ws_->d_tensor_half_bounds, values * sizeof(double)));
+        check_cuda(cudaMallocHost(&ws_->h_tensor_half_bounds, values * sizeof(double)));
+    }
+
     if (!skips_candidate_refinement(options_.algorithm_variant)) check_cuda(cudaMemset(
         ws_->d_partial_query_scores,
         0,
@@ -668,6 +679,12 @@ void chimera_index::release_resources() noexcept {
         release_gpu_full_bit();
         (void)cudaFree(ws_->d_document_reduce_reference);
         (void)cudaFreeHost(ws_->h_document_reduce_reference);
+        (void)cudaFree(ws_->d_tensor_querymax_capture);
+        (void)cudaFreeHost(ws_->h_tensor_querymax_capture);
+        (void)cudaFree(ws_->d_tensor_half_reference);
+        (void)cudaFreeHost(ws_->h_tensor_half_reference);
+        (void)cudaFree(ws_->d_tensor_half_bounds);
+        (void)cudaFreeHost(ws_->h_tensor_half_bounds);
         if (!ws_->uma_query_buffers) {
             (void)cudaFree(ws_->d_queries);
             (void)cudaFree(ws_->d_cb1_sumq);

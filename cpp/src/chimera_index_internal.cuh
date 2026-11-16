@@ -42,6 +42,13 @@ struct chimera_index::Workspace {
     float* d_one_bit_document_scores = nullptr;
     float* d_document_reduce_reference = nullptr;  // Diagnostic only.
     float* h_document_reduce_reference = nullptr;
+    // Private lane-owned diagnostics, allocated only for TensorPadded+verify.
+    float* d_tensor_querymax_capture = nullptr;
+    float* h_tensor_querymax_capture = nullptr;
+    double* d_tensor_half_reference = nullptr;
+    double* h_tensor_half_reference = nullptr;
+    double* d_tensor_half_bounds = nullptr;
+    double* h_tensor_half_bounds = nullptr;
     float* d_lut = nullptr;
     float* d_cagra_dists = nullptr;
     uint32_t* d_cagra_labels = nullptr;
