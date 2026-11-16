@@ -621,14 +621,17 @@ void chimera_index::collaborative_document_scoring(
                 ? d_doc_order_onebit_factors_ : d_clustered_one_bit_factors_;
             if (chunk_count > 0) {
                 const int threads = options_.fused_token_document_threads;
-                const size_t shared_bytes = (4104 + (threads / 32) * 8) * sizeof(float);
+                const size_t shared_bytes = options_.fused_token_document_layout == FusedTokenDocumentLayout::Warp4Doc
+                    ? size_t(4104) * sizeof(float)
+                    : (4104 + (threads / 32) * 8) * sizeof(float);
                 if (direct_docs) {
                     if (!ws_->uma_query_buffers || !ws_->d_mapped_refined_doc_ids ||
                         (collect_direct_lengths && (!ws_->d_refined_doc_lengths || !ws_->h_refined_doc_lengths)))
                         throw std::runtime_error("Missing direct fusion mapped metadata buffers");
-                    const dim3 grid(static_cast<unsigned>(chunk_count), 4);
-                    if (threads == 128) {
-                        fused_token_document_detail::fused_token_doc_direct_groups<128><<<
+                    if (options_.fused_token_document_layout == FusedTokenDocumentLayout::Warp4Doc) {
+                        if (threads != 128) throw std::runtime_error("Warp4doc direct launch requires 128 threads");
+                        const dim3 grid((static_cast<unsigned>(chunk_count) + 3) / 4, 4);
+                        fused_token_document_detail::fused_warp4_documents_direct<<<
                             grid, 128, shared_bytes, stream>>>(
                             ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
                             refined_ids, d_doc_ptrs_, ws_->d_one_bit_token_scores,
@@ -636,13 +639,24 @@ void chimera_index::collaborative_document_scoring(
                             collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
                             static_cast<size_t>(chunk_count));
                     } else {
-                        fused_token_document_detail::fused_token_doc_direct_groups<256><<<
-                            grid, 256, shared_bytes, stream>>>(
-                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
-                            refined_ids, d_doc_ptrs_, ws_->d_one_bit_token_scores,
-                            ws_->d_mapped_refined_doc_ids,
-                            collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
-                            static_cast<size_t>(chunk_count));
+                        const dim3 grid(static_cast<unsigned>(chunk_count), 4);
+                        if (threads == 128) {
+                            fused_token_document_detail::fused_token_doc_direct_groups<128><<<
+                                grid, 128, shared_bytes, stream>>>(
+                                ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                refined_ids, d_doc_ptrs_, ws_->d_one_bit_token_scores,
+                                ws_->d_mapped_refined_doc_ids,
+                                collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
+                                static_cast<size_t>(chunk_count));
+                        } else {
+                            fused_token_document_detail::fused_token_doc_direct_groups<256><<<
+                                grid, 256, shared_bytes, stream>>>(
+                                ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                refined_ids, d_doc_ptrs_, ws_->d_one_bit_token_scores,
+                                ws_->d_mapped_refined_doc_ids,
+                                collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
+                                static_cast<size_t>(chunk_count));
+                        }
                     }
                 } else {
                 switch (options_.fused_token_document_layout) {
@@ -695,6 +709,16 @@ void chimera_index::collaborative_document_scoring(
                                     ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
                                     ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
                         }
+                        break;
+                    }
+                    case FusedTokenDocumentLayout::Warp4Doc: {
+                        if (threads != 128) throw std::runtime_error("Warp4doc launch requires 128 threads");
+                        const dim3 grid((static_cast<unsigned>(chunk_count) + 3) / 4, 4);
+                        fused_token_document_detail::fused_warp4_documents<<<
+                            grid, 128, shared_bytes, stream>>>(
+                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                            ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                            ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
                         break;
                     }
                     default: throw std::runtime_error("Unknown fused token/document layout at launch");

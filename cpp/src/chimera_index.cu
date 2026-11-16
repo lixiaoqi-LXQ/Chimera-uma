@@ -40,14 +40,19 @@ void chimera_index::validate_search_options(const SearchOptions& options) {
     if (options.fused_direct_docs &&
         (!options.fused_token_document || !options.doc_order_onebit || !options.uma_query_buffers ||
          options.num_chunks != 1 || options.uma_cpu_refine ||
-         options.fused_token_document_layout != FusedTokenDocumentLayout::Grouped))
-        throw std::invalid_argument("Direct document fusion requires fused scoring, doc-order replica, UMA query buffers, chunks1, grouped layout and no CPU refine");
+         (options.fused_token_document_layout != FusedTokenDocumentLayout::Grouped &&
+          options.fused_token_document_layout != FusedTokenDocumentLayout::Warp4Doc)))
+        throw std::invalid_argument("Direct document fusion requires fused scoring, doc-order replica, UMA query buffers, chunks1, grouped/warp4doc layout and no CPU refine");
     switch (options.fused_token_document_layout) {
         case FusedTokenDocumentLayout::Grouped:
         case FusedTokenDocumentLayout::Interleaved:
-        case FusedTokenDocumentLayout::Cached: break;
+        case FusedTokenDocumentLayout::Cached:
+        case FusedTokenDocumentLayout::Warp4Doc: break;
         default: throw std::invalid_argument("Unknown fused token/document layout");
     }
+    if (options.fused_token_document_layout == FusedTokenDocumentLayout::Warp4Doc &&
+        options.fused_token_document_threads != 128)
+        throw std::invalid_argument("Warp4doc fusion requires exactly 128 threads");
     if (!options.fused_token_document &&
         options.fused_token_document_layout != FusedTokenDocumentLayout::Grouped)
         throw std::invalid_argument("Fused token/document layout selection requires fused scoring");

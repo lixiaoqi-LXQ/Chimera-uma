@@ -321,4 +321,115 @@ __global__ void fused_token_doc_direct_groups(
     }
 }
 
+// Warp4doc: exact qualified positions body, plus a natural-address direct variant.
+// Four independent document warps share one Q8 LUT tile. All 128 threads reach
+// the one CTA barrier before the final-block invalid warps return together.
+__global__ void fused_warp4_documents(
+    const float* __restrict__ lut,
+    const uint4* __restrict__ codes,
+    const float* __restrict__ factors,
+    const float* __restrict__ cb,
+    const uint32_t* __restrict__ positions,
+    const size_t* __restrict__ offsets,
+    float* __restrict__ query_maxima,
+    size_t docs) {
+    extern __shared__ float shared[];
+    float* tile_lut=shared;
+    float* tile_cb=shared+4096;
+    const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,q0=int(blockIdx.y)*8;
+    for(int i=tid;i<4096;i+=128)tile_lut[i]=lut[q0*512+i];
+    if(tid<8)tile_cb[tid]=cb[q0+tid];
+    __syncthreads();
+    const size_t doc=size_t(blockIdx.x)*4+size_t(warp);
+    if(doc>=docs)return;  // warp-uniform; always after the only CTA barrier.
+    float maxima[8];
+    #pragma unroll
+    for(int q=0;q<8;++q)maxima[q]=-FLT_MAX;
+    for(size_t t=offsets[doc]+size_t(lane);t<offsets[doc+1];t+=32) {
+        const uint32_t pos=positions[t];
+        const uint4 code=codes[pos];
+        const uint64_t low=(uint64_t(code.y)<<32)|code.x;
+        const uint64_t high=(uint64_t(code.w)<<32)|code.z;
+        const float factor=factors[pos];
+        float ip[8]={};
+        #pragma unroll 1
+        for(int c=0;c<32;++c) {
+            const uint64_t packed=c<16?low:high;
+            const int nibble=int((packed>>((c&15)*4))&15);
+            const int address=c*16+nibble;
+            #pragma unroll
+            for(int q=0;q<8;++q)ip[q]+=tile_lut[q*512+address];
+        }
+        #pragma unroll
+        for(int q=0;q<8;++q)maxima[q]=fmaxf(maxima[q],(ip[q]-tile_cb[q])*factor);
+    }
+    #pragma unroll
+    for(int q=0;q<8;++q) {
+        float value=maxima[q];
+        #pragma unroll
+        for(int delta=16;delta;delta>>=1)value=fmaxf(value,__shfl_down_sync(0xffffffffu,value,delta));
+        if(lane==0)query_maxima[doc*32+size_t(q0+q)]=value;
+    }
+}
+
+// Four independent document warps share one Q8 LUT tile. All 128 threads reach
+// the one CTA barrier before the final-block invalid warps return together.
+__global__ void fused_warp4_documents_direct(
+    const float* __restrict__ lut,
+    const uint4* __restrict__ codes,
+    const float* __restrict__ factors,
+    const float* __restrict__ cb,
+    const int* __restrict__ refined_ids,
+    const int* __restrict__ doc_ptrs,
+    float* __restrict__ query_maxima,
+    int* __restrict__ mapped_refined_ids,
+    int* __restrict__ diagnostic_lengths,
+    size_t docs) {
+    extern __shared__ float shared[];
+    float* tile_lut=shared;
+    float* tile_cb=shared+4096;
+    const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,q0=int(blockIdx.y)*8;
+    for(int i=tid;i<4096;i+=128)tile_lut[i]=lut[q0*512+i];
+    if(tid<8)tile_cb[tid]=cb[q0+tid];
+    __syncthreads();
+    const size_t doc=size_t(blockIdx.x)*4+size_t(warp);
+    if(doc>=docs)return;  // warp-uniform; always after the only CTA barrier.
+    const int doc_id=refined_ids[doc];
+    const size_t begin=static_cast<size_t>(doc_ptrs[doc_id]);
+    const size_t end=static_cast<size_t>(doc_ptrs[doc_id+1]);
+    // Exactly one lane of the q0=0 CTA writes each document's metadata;
+    // existing chunk completion events protect all subsequent host reads.
+    if(q0==0&&lane==0) {
+        mapped_refined_ids[doc]=doc_id;
+        if(diagnostic_lengths)diagnostic_lengths[doc]=static_cast<int>(end-begin);
+    }
+    float maxima[8];
+    #pragma unroll
+    for(int q=0;q<8;++q)maxima[q]=-FLT_MAX;
+    for(size_t pos=begin+size_t(lane);pos<end;pos+=32) {
+        const uint4 code=codes[pos];
+        const uint64_t low=(uint64_t(code.y)<<32)|code.x;
+        const uint64_t high=(uint64_t(code.w)<<32)|code.z;
+        const float factor=factors[pos];
+        float ip[8]={};
+        #pragma unroll 1
+        for(int c=0;c<32;++c) {
+            const uint64_t packed=c<16?low:high;
+            const int nibble=int((packed>>((c&15)*4))&15);
+            const int address=c*16+nibble;
+            #pragma unroll
+            for(int q=0;q<8;++q)ip[q]+=tile_lut[q*512+address];
+        }
+        #pragma unroll
+        for(int q=0;q<8;++q)maxima[q]=fmaxf(maxima[q],(ip[q]-tile_cb[q])*factor);
+    }
+    #pragma unroll
+    for(int q=0;q<8;++q) {
+        float value=maxima[q];
+        #pragma unroll
+        for(int delta=16;delta;delta>>=1)value=fmaxf(value,__shfl_down_sync(0xffffffffu,value,delta));
+        if(lane==0)query_maxima[doc*32+size_t(q0+q)]=value;
+    }
+}
+
 } }  // namespace Chimera::fused_token_document_detail

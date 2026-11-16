@@ -114,8 +114,8 @@ int main(int argc,char** argv) try {
                 << "  [--cagra-team-size 0|4|8|16|32 --cagra-thread-block-size 0|64|128|256|512|1024 --cagra-search-width N]\n"
                 << "  [--split-token-score] (custom stage, excludes compact/fused/CPU document)\n"
                 << "  [--fused-token-document --fused-token-document-threads 128|256] (custom stage, chunks1)\n"
-                << "  [--fused-token-document-layout grouped|interleaved|cached] (requires fused scoring)\n"
-                << "  [--fused-direct-docs] (requires fused+doc-order+UMA, grouped/chunks1, no CPU refine)\n"
+                << "  [--fused-token-document-layout grouped|interleaved|cached|warp4doc] (requires fused scoring; warp4doc requires 128 threads)\n"
+                << "  [--fused-direct-docs] (requires fused+doc-order+UMA, grouped|warp4doc layout, chunks1, no CPU refine)\n"
                 << "  [--verify-full-bit --limit N --batch-only --profile-range]\n"
                 << "Native B1 and batch are both measured unless --batch-only is selected.\n"
                 << "Named stages exclude archived GPU-kernel and UMA-buffer experiments.\n"
@@ -133,6 +133,7 @@ int main(int argc,char** argv) try {
             if(value=="grouped") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::Grouped;
             else if(value=="interleaved") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::Interleaved;
             else if(value=="cached") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::Cached;
+            else if(value=="warp4doc") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::Warp4Doc;
             else throw std::invalid_argument("Unknown fused token/document layout");
             explicit_fused_layout=true;custom_backend_switch=true;
         }
@@ -175,11 +176,18 @@ int main(int argc,char** argv) try {
     // Reject invalid feature contracts before query-file reads/index loading.
     if (options.fused_token_document_threads != 128 && options.fused_token_document_threads != 256)
         throw std::invalid_argument("Fused token/document CTA size must be 128 or 256");
+    if (options.fused_token_document_layout == Chimera::FusedTokenDocumentLayout::Warp4Doc &&
+        options.fused_token_document_threads != 128)
+        throw std::invalid_argument("Warp4doc fusion requires exactly 128 threads");
+    if (options.fused_token_document &&
+        (options.split_token_score || options.compact_token_score || options.fast_document_reduce || options.uma_cpu_document))
+        throw std::invalid_argument("Fused token/document scoring conflicts with split/compact/fast/CPU document scoring");
     if (options.fused_direct_docs &&
         (!options.fused_token_document || !options.doc_order_onebit || !options.uma_query_buffers ||
          options.num_chunks != 1 || options.uma_cpu_refine ||
-         options.fused_token_document_layout != Chimera::FusedTokenDocumentLayout::Grouped))
-        throw std::invalid_argument("Direct document fusion requires fused scoring, doc-order replica, UMA query buffers, chunks1, grouped layout and no CPU refine");
+         (options.fused_token_document_layout != Chimera::FusedTokenDocumentLayout::Grouped &&
+          options.fused_token_document_layout != Chimera::FusedTokenDocumentLayout::Warp4Doc)))
+        throw std::invalid_argument("Direct document fusion requires fused scoring, doc-order replica, UMA query buffers, chunks1, grouped/warp4doc layout and no CPU refine");
     if (options.fused_direct_docs &&
         (options.split_token_score || options.compact_token_score || options.fast_document_reduce || options.uma_cpu_document))
         throw std::invalid_argument("Direct document fusion conflicts with split/compact/fast/CPU document scoring");
