@@ -464,7 +464,15 @@ void chimera_index::collaborative_document_scoring(
 
     const int* refined_ids = options_.uma_cpu_refine
         ? ws_->h_refined_doc_ids : ws_->d_candidate_doc_ids;
+    const bool direct_docs = options_.fused_direct_docs;
+    // The old metadata path is retained only for ordinary scoring or an
+    // explicit original-kernel oracle. The primary direct kernel still runs
+    // during verification; only its reference needs materialized positions.
+    const bool metadata_ready = !direct_docs || options_.verify_full_bit;
+    const bool collect_direct_lengths = direct_docs &&
+        (options_.verify_full_bit || (profiling_enabled_ && profile_query_id_ >= 0));
     size_t total_tokens = 0;
+    if (metadata_ready) {
     if (options_.uma_cpu_refine) {
         // Selected IDs already belong to the CPU. Derive the tiny metadata
         // directly; do not round-trip to a GPU length gather and host wait.
@@ -551,17 +559,24 @@ void chimera_index::collaborative_document_scoring(
         check_cuda(cudaStreamSynchronize(stream));
         total_tokens = *ws_->h_num_refined_tokens;
     }
-    // UMA metadata is already CPU-ready. gather_refined_token_positions stays
-    // queued before scoring in the same compute stream; no extra host wait.
+    }
+    // Ordinary/verification metadata is CPU-ready here. Direct scoring leaves
+    // mapped IDs/diagnostic lengths GPU-owned until the existing final event;
+    // constructing this CPU pointer does not read its not-yet-ready contents.
     const int* refined_doc_ids = ws_->h_refined_doc_ids;
+    std::vector<int> direct_reference_ids;
+    if (direct_docs && options_.verify_full_bit)
+        direct_reference_ids.assign(refined_doc_ids, refined_doc_ids + num_refined_candidates);
     if (profiling_enabled_ && profile_query_id_ >= 0) {
         profile_refined_docs_ = size_t(num_refined_candidates);
         // The ordinary metadata handoff already provides the exact scan total.
         // Observe it in O(1), without adding a random doc-pointer walk before
         // the GPU token launch or an additional CUDA wait.
-        profile_refined_tokens_ = total_tokens;
-        if (ws_->h_pinned_refined_doc_offsets[num_refined_candidates] != total_tokens)
-            throw std::runtime_error("Profile refined token count disagrees with actual document offsets");
+        if (!direct_docs) {
+            profile_refined_tokens_ = total_tokens;
+            if (ws_->h_pinned_refined_doc_offsets[num_refined_candidates] != total_tokens)
+                throw std::runtime_error("Profile refined token count disagrees with actual document offsets");
+        } // Direct counts are written by the scoring kernel and read after its existing event below.
     }
 
     // Score the chunks on the GPU while completed chunks stream to the CPU.
@@ -586,10 +601,10 @@ void chimera_index::collaborative_document_scoring(
         const int chunk_start = bounds.first;
         const int chunk_end = bounds.second;
         const int chunk_count = chunk_end - chunk_start;
-        const size_t token_start =
-            ws_->h_pinned_refined_doc_offsets[chunk_start];
-        const size_t token_end =
-            ws_->h_pinned_refined_doc_offsets[chunk_end];
+        const size_t token_start = metadata_ready
+            ? ws_->h_pinned_refined_doc_offsets[chunk_start] : 0;
+        const size_t token_end = metadata_ready
+            ? ws_->h_pinned_refined_doc_offsets[chunk_end] : 0;
         const size_t token_count = token_end - token_start;
 
         if (options_.fused_token_document) {
@@ -607,6 +622,29 @@ void chimera_index::collaborative_document_scoring(
             if (chunk_count > 0) {
                 const int threads = options_.fused_token_document_threads;
                 const size_t shared_bytes = (4104 + (threads / 32) * 8) * sizeof(float);
+                if (direct_docs) {
+                    if (!ws_->uma_query_buffers || !ws_->d_mapped_refined_doc_ids ||
+                        (collect_direct_lengths && (!ws_->d_refined_doc_lengths || !ws_->h_refined_doc_lengths)))
+                        throw std::runtime_error("Missing direct fusion mapped metadata buffers");
+                    const dim3 grid(static_cast<unsigned>(chunk_count), 4);
+                    if (threads == 128) {
+                        fused_token_document_detail::fused_token_doc_direct_groups<128><<<
+                            grid, 128, shared_bytes, stream>>>(
+                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                            refined_ids, d_doc_ptrs_, ws_->d_one_bit_token_scores,
+                            ws_->d_mapped_refined_doc_ids,
+                            collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
+                            static_cast<size_t>(chunk_count));
+                    } else {
+                        fused_token_document_detail::fused_token_doc_direct_groups<256><<<
+                            grid, 256, shared_bytes, stream>>>(
+                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                            refined_ids, d_doc_ptrs_, ws_->d_one_bit_token_scores,
+                            ws_->d_mapped_refined_doc_ids,
+                            collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
+                            static_cast<size_t>(chunk_count));
+                    }
+                } else {
                 switch (options_.fused_token_document_layout) {
                     case FusedTokenDocumentLayout::Grouped: {
                         const dim3 grid(static_cast<unsigned>(chunk_count), 4);
@@ -660,6 +698,7 @@ void chimera_index::collaborative_document_scoring(
                         break;
                     }
                     default: throw std::runtime_error("Unknown fused token/document layout at launch");
+                }
                 }
                 check_cuda(cudaGetLastError());
                 fused_token_document_detail::fused_document_sum<<<chunk_count, 32, 0, stream>>>(
@@ -842,6 +881,31 @@ void chimera_index::collaborative_document_scoring(
                 ? chunk_compute_done[chunk] : chunk_d2h_done[chunk]));
         }
 
+        if (direct_docs && chunk_count > 0) {
+            if (options_.verify_full_bit) {
+                if (direct_reference_ids.size() != static_cast<size_t>(num_refined_candidates))
+                    throw std::runtime_error("Missing direct fusion reference document IDs");
+                for (int i = chunk_start; i < chunk_end; ++i)
+                    if (refined_doc_ids[i] != direct_reference_ids[i])
+                        throw std::runtime_error("Direct fusion mapped document ID differs at candidate " + std::to_string(i));
+            }
+            if (collect_direct_lengths) {
+                size_t actual_tokens = 0;
+                for (int i = chunk_start; i < chunk_end; ++i) {
+                    const int length = ws_->h_refined_doc_lengths[i];
+                    if (length < 0) throw std::runtime_error("Direct fusion wrote a negative document length");
+                    actual_tokens += static_cast<size_t>(length);
+                }
+                if (options_.verify_full_bit && actual_tokens != total_tokens)
+                    throw std::runtime_error("Direct fusion token count differs from original metadata");
+                if (profiling_enabled_ && profile_query_id_ >= 0)
+                    profile_refined_tokens_ = actual_tokens;
+                if (options_.verify_full_bit)
+                    std::cout << "[FUSED_DIRECT_DOCS_VERIFY] candidates=" << chunk_count
+                              << " tokens=" << actual_tokens << " ids_exact=passed token_count=passed\n";
+            }
+        }
+
         if (ws_->cpu_document_enabled && chunk_count > 0) {
             if (!cpu_task_pool_) throw std::runtime_error("CPU document worker pool is unavailable");
             const bool qid_profile = profiling_enabled_ && profile_query_id_ >= 0;
@@ -880,7 +944,8 @@ void chimera_index::collaborative_document_scoring(
                                                         : "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=") << chunk_count;
             if (options_.fused_token_document)
                 std::cout << " threads=" << options_.fused_token_document_threads
-                          << " layout=" << fused_token_document_layout_name(options_.fused_token_document_layout);
+                          << " layout=" << fused_token_document_layout_name(options_.fused_token_document_layout)
+                          << " direct_docs=" << (options_.fused_direct_docs ? 1 : 0);
             std::cout << " scores_fp32_bitwise=passed\n";
         }
 

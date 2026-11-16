@@ -89,6 +89,7 @@ int main(int argc,char** argv) try {
         if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;custom_backend_switch=true;continue; }
         if(arg=="--doc-order-onebit") { options.doc_order_onebit=true;custom_backend_switch=true;continue; }
         if(arg=="--fused-token-document") { options.fused_token_document=true;custom_backend_switch=true;continue; }
+        if(arg=="--fused-direct-docs") { options.fused_direct_docs=true;custom_backend_switch=true;continue; }
         if(arg=="--split-token-score") { options.split_token_score=true;custom_backend_switch=true;continue; }
         if(arg=="--compact-token-score") { options.compact_token_score=true;continue; }
         if(arg=="--fast-document-reduce") { options.fast_document_reduce=true;continue; }
@@ -114,6 +115,7 @@ int main(int argc,char** argv) try {
                 << "  [--split-token-score] (custom stage, excludes compact/fused/CPU document)\n"
                 << "  [--fused-token-document --fused-token-document-threads 128|256] (custom stage, chunks1)\n"
                 << "  [--fused-token-document-layout grouped|interleaved|cached] (requires fused scoring)\n"
+                << "  [--fused-direct-docs] (requires fused+doc-order+UMA, grouped/chunks1, no CPU refine)\n"
                 << "  [--verify-full-bit --limit N --batch-only --profile-range]\n"
                 << "Native B1 and batch are both measured unless --batch-only is selected.\n"
                 << "Named stages exclude archived GPU-kernel and UMA-buffer experiments.\n"
@@ -170,6 +172,17 @@ int main(int argc,char** argv) try {
         else if(arg=="--uma-cpu-pool-cpus") { options.uma_cpu_pool_cpus=value;custom_backend_switch=true; }
         else throw std::invalid_argument("Unknown option "+arg);
     }
+    // Reject invalid feature contracts before query-file reads/index loading.
+    if (options.fused_token_document_threads != 128 && options.fused_token_document_threads != 256)
+        throw std::invalid_argument("Fused token/document CTA size must be 128 or 256");
+    if (options.fused_direct_docs &&
+        (!options.fused_token_document || !options.doc_order_onebit || !options.uma_query_buffers ||
+         options.num_chunks != 1 || options.uma_cpu_refine ||
+         options.fused_token_document_layout != Chimera::FusedTokenDocumentLayout::Grouped))
+        throw std::invalid_argument("Direct document fusion requires fused scoring, doc-order replica, UMA query buffers, chunks1, grouped layout and no CPU refine");
+    if (options.fused_direct_docs &&
+        (options.split_token_score || options.compact_token_score || options.fast_document_reduce || options.uma_cpu_document))
+        throw std::invalid_argument("Direct document fusion conflicts with split/compact/fast/CPU document scoring");
     if (explicit_fused_layout && !options.fused_token_document)
         throw std::invalid_argument("--fused-token-document-layout requires --fused-token-document");
     if (explicit_fused_threads && !options.fused_token_document)
@@ -234,6 +247,7 @@ int main(int argc,char** argv) try {
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
         <<",\"doc_order_onebit\":"<<(options.doc_order_onebit?"true":"false")
         <<",\"fused_token_document\":"<<(options.fused_token_document?"true":"false")
+        <<",\"fused_direct_docs\":"<<(options.fused_direct_docs?"true":"false")
         <<",\"fused_token_document_threads\":"<<options.fused_token_document_threads
         <<",\"fused_token_document_layout\":\""<<Chimera::fused_token_document_layout_name(options.fused_token_document_layout)<<"\""
         <<",\"split_token_score\":"<<(options.split_token_score?"true":"false")

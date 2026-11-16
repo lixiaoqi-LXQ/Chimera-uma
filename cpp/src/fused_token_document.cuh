@@ -248,4 +248,77 @@ __global__ void fused_token_doc_cached(
     }
 }
 
+
+// Opt-in grouped direct-doc path. Document-order code/factor arrays use the
+// same natural token IDs as doc_ptrs; no per-query offsets/position list is read.
+template<int Threads>
+__global__ void fused_token_doc_direct_groups(
+    const float* __restrict__ lut,
+    const uint4* __restrict__ codes,
+    const float* __restrict__ factors,
+    const float* __restrict__ cb,
+    const int* __restrict__ refined_ids,
+    const int* __restrict__ doc_ptrs,
+    float* __restrict__ query_maxima,
+    int* __restrict__ mapped_refined_ids,
+    int* __restrict__ diagnostic_lengths,
+    size_t docs) {
+    static_assert(Threads == 128 || Threads == 256, "Supported CTA choices");
+    extern __shared__ float shared[];
+    float* tile_lut=shared;
+    float* tile_cb=shared+4096;
+    float* warp_maxima=shared+4104;
+    const size_t doc=blockIdx.x;
+    const int q0=int(blockIdx.y)*8, tid=threadIdx.x, lane=tid&31, warp=tid>>5;
+    if(doc>=docs)return;
+    const int doc_id=refined_ids[doc];
+    const size_t begin=static_cast<size_t>(doc_ptrs[doc_id]);
+    const size_t end=static_cast<size_t>(doc_ptrs[doc_id+1]);
+    // A single CTA/thread writes each mapped metadata element. The caller
+    // waits for the existing completion event before any CPU reader uses it.
+    if(q0==0&&tid==0) {
+        mapped_refined_ids[doc]=doc_id;
+        if(diagnostic_lengths)diagnostic_lengths[doc]=static_cast<int>(end-begin);
+    }
+    for(int i=tid;i<4096;i+=Threads)tile_lut[i]=lut[q0*512+i];
+    if(tid<8)tile_cb[tid]=cb[q0+tid];
+    __syncthreads();
+    float maxima[8];
+    #pragma unroll
+    for(int q=0;q<8;++q)maxima[q]=-FLT_MAX;
+    for(size_t pos=begin+tid;pos<end;pos+=Threads) {
+        const uint4 code=codes[pos];
+        const uint64_t low=(uint64_t(code.y)<<32)|code.x;
+        const uint64_t high=(uint64_t(code.w)<<32)|code.z;
+        const float factor=factors[pos];
+        float ip[8]={};
+        // Keeping this loop rolled bounds decoded-value live ranges while
+        // keeping every query's FP32 accumulation sequence unchanged.
+        #pragma unroll 1
+        for(int c=0;c<32;++c) {
+            const uint64_t packed=c<16?low:high;
+            const int nibble=int((packed>>((c&15)*4))&15);
+            const int address=c*16+nibble;
+            #pragma unroll
+            for(int q=0;q<8;++q)ip[q]+=tile_lut[q*512+address];
+        }
+        #pragma unroll
+        for(int q=0;q<8;++q)maxima[q]=fmaxf(maxima[q],(ip[q]-tile_cb[q])*factor);
+    }
+    #pragma unroll
+    for(int q=0;q<8;++q) {
+        float value=maxima[q];
+        #pragma unroll
+        for(int delta=16;delta;delta>>=1)value=fmaxf(value,__shfl_down_sync(0xffffffffu,value,delta));
+        if(lane==0)warp_maxima[warp*8+q]=value;
+    }
+    __syncthreads();
+    if(tid<8) {
+        float value=-FLT_MAX;
+        #pragma unroll
+        for(int w=0;w<Threads/32;++w)value=fmaxf(value,warp_maxima[w*8+tid]);
+        query_maxima[doc*32+q0+tid]=value;
+    }
+}
+
 } }  // namespace Chimera::fused_token_document_detail

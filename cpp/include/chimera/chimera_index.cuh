@@ -96,6 +96,7 @@ struct SearchOptions {
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
     bool doc_order_onebit = false;  // Optional document-order replica, built and verified once at load.
     bool fused_token_document = false;  // Opt-in Q8 groups, small query-max scratch, then original-order sum.
+    bool fused_direct_docs = false;  // Grouped fusion reads natural doc ranges; bypass ordinary refined metadata handoff.
     int fused_token_document_threads = 128;  // Supported CTA sizes: 128 or 256.
     FusedTokenDocumentLayout fused_token_document_layout = FusedTokenDocumentLayout::Grouped;
     bool split_token_score = false;  // Opt-in independent Q8 CTA groups, original score matrix.

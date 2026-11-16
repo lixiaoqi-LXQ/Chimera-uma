@@ -20,7 +20,7 @@ inline EvolutionStage parse_evolution_stage(const std::string& name) {
 // the execution backend and excludes the archived kernel/metadata experiments.
 inline void apply_evolution_stage(EvolutionStage stage, SearchOptions& options) {
     if (stage == EvolutionStage::Custom) return;
-    if (options.doc_order_onebit || options.fused_token_document ||
+    if (options.doc_order_onebit || options.fused_token_document || options.fused_direct_docs ||
         options.fused_token_document_threads != 128 ||
         options.fused_token_document_layout != FusedTokenDocumentLayout::Grouped ||
         options.split_token_score || options.compact_token_score || options.fast_document_reduce ||
