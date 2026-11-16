@@ -605,21 +605,61 @@ void chimera_index::collaborative_document_scoring(
             const float* factors = options_.doc_order_onebit
                 ? d_doc_order_onebit_factors_ : d_clustered_one_bit_factors_;
             if (chunk_count > 0) {
-                const dim3 fused_grid(static_cast<unsigned>(chunk_count), 4);
                 const int threads = options_.fused_token_document_threads;
                 const size_t shared_bytes = (4104 + (threads / 32) * 8) * sizeof(float);
-                if (threads == 128) {
-                    fused_token_document_detail::fused_token_doc_groups<128><<<
-                        fused_grid, 128, shared_bytes, stream>>>(
-                        ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
-                        ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
-                        ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
-                } else {
-                    fused_token_document_detail::fused_token_doc_groups<256><<<
-                        fused_grid, 256, shared_bytes, stream>>>(
-                        ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
-                        ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
-                        ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                switch (options_.fused_token_document_layout) {
+                    case FusedTokenDocumentLayout::Grouped: {
+                        const dim3 grid(static_cast<unsigned>(chunk_count), 4);
+                        if (threads == 128) {
+                            fused_token_document_detail::fused_token_doc_groups<128><<<
+                                grid, 128, shared_bytes, stream>>>(
+                                    ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                    ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                    ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        } else {
+                            fused_token_document_detail::fused_token_doc_groups<256><<<
+                                grid, 256, shared_bytes, stream>>>(
+                                    ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                    ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                    ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        }
+                        break;
+                    }
+                    case FusedTokenDocumentLayout::Interleaved: {
+                        const dim3 grid(static_cast<unsigned>(chunk_count) * 4, 1);
+                        if (threads == 128) {
+                            fused_token_document_detail::fused_token_doc_groups_interleaved<128><<<
+                                grid, 128, shared_bytes, stream>>>(
+                                    ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                    ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                    ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        } else {
+                            fused_token_document_detail::fused_token_doc_groups_interleaved<256><<<
+                                grid, 256, shared_bytes, stream>>>(
+                                    ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                    ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                    ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        }
+                        break;
+                    }
+                    case FusedTokenDocumentLayout::Cached: {
+                        const dim3 grid(static_cast<unsigned>(chunk_count), 1);
+                        if (threads == 128) {
+                            fused_token_document_detail::fused_token_doc_cached<128><<<
+                                grid, 128, shared_bytes, stream>>>(
+                                    ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                    ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                    ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        } else {
+                            fused_token_document_detail::fused_token_doc_cached<256><<<
+                                grid, 256, shared_bytes, stream>>>(
+                                    ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                    ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                    ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        }
+                        break;
+                    }
+                    default: throw std::runtime_error("Unknown fused token/document layout at launch");
                 }
                 check_cuda(cudaGetLastError());
                 fused_token_document_detail::fused_document_sum<<<chunk_count, 32, 0, stream>>>(
@@ -839,7 +879,8 @@ void chimera_index::collaborative_document_scoring(
                             : ws_->cpu_document_enabled ? "[CPU_DOCUMENT_POOL_VERIFY] candidates="
                                                         : "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=") << chunk_count;
             if (options_.fused_token_document)
-                std::cout << " threads=" << options_.fused_token_document_threads;
+                std::cout << " threads=" << options_.fused_token_document_threads
+                          << " layout=" << fused_token_document_layout_name(options_.fused_token_document_layout);
             std::cout << " scores_fp32_bitwise=passed\n";
         }
 

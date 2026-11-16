@@ -69,6 +69,15 @@ inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == Algorithm
 enum class CagraMemoryPlacement { Device, AtsDataset, AtsDatasetAndGraph };
 // Existing cuVS search implementations; this only controls host dispatch.
 enum class CagraSearchAlgorithm { Auto = 100, SingleCta = 0, MultiCta = 1, MultiKernel = 2 };
+enum class FusedTokenDocumentLayout { Grouped, Interleaved, Cached };
+inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout layout) {
+    switch (layout) {
+        case FusedTokenDocumentLayout::Grouped: return "grouped";
+        case FusedTokenDocumentLayout::Interleaved: return "interleaved";
+        case FusedTokenDocumentLayout::Cached: return "cached";
+        default: throw std::invalid_argument("Unknown fused token/document layout");
+    }
+}
 
 struct SearchOptions {
     AlgorithmVariant algorithm_variant = AlgorithmVariant::Full;
@@ -88,6 +97,7 @@ struct SearchOptions {
     bool doc_order_onebit = false;  // Optional document-order replica, built and verified once at load.
     bool fused_token_document = false;  // Opt-in Q8 groups, small query-max scratch, then original-order sum.
     int fused_token_document_threads = 128;  // Supported CTA sizes: 128 or 256.
+    FusedTokenDocumentLayout fused_token_document_layout = FusedTokenDocumentLayout::Grouped;
     bool split_token_score = false;  // Opt-in independent Q8 CTA groups, original score matrix.
     bool compact_token_score = false;  // Independent opt-in bounded-register token scorer.
     bool fast_document_reduce = false;  // Independent opt-in GPU warp document reduction.

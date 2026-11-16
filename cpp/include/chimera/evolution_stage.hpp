@@ -22,6 +22,7 @@ inline void apply_evolution_stage(EvolutionStage stage, SearchOptions& options) 
     if (stage == EvolutionStage::Custom) return;
     if (options.doc_order_onebit || options.fused_token_document ||
         options.fused_token_document_threads != 128 ||
+        options.fused_token_document_layout != FusedTokenDocumentLayout::Grouped ||
         options.split_token_score || options.compact_token_score || options.fast_document_reduce ||
         options.uma_query_buffers || options.uma_cpu_candidates || options.uma_cpu_refine ||
         options.cagra_memory_placement != CagraMemoryPlacement::Device)

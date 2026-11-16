@@ -37,6 +37,15 @@
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    switch (options.fused_token_document_layout) {
+        case FusedTokenDocumentLayout::Grouped:
+        case FusedTokenDocumentLayout::Interleaved:
+        case FusedTokenDocumentLayout::Cached: break;
+        default: throw std::invalid_argument("Unknown fused token/document layout");
+    }
+    if (!options.fused_token_document &&
+        options.fused_token_document_layout != FusedTokenDocumentLayout::Grouped)
+        throw std::invalid_argument("Fused token/document layout selection requires fused scoring");
     if (options.split_token_score &&
         (options.compact_token_score || options.fused_token_document || options.uma_cpu_document))
         throw std::invalid_argument("Split token scoring cannot combine compact token, fused token/document or CPU document scoring");
@@ -422,6 +431,7 @@ void chimera_index::initialize_search_state() {
     }
 
     if (options_.doc_order_onebit) {
+        const auto replica_begin = std::chrono::steady_clock::now();
         static_assert(PADDED_DIM == 128, "Document-order replica expects D128/16B codes");
         check_cuda(cudaMalloc(&d_doc_order_onebit_codes_, n*16));
         check_cuda(cudaMalloc(&d_doc_order_onebit_factors_, n*sizeof(float)));
@@ -445,7 +455,9 @@ void chimera_index::initialize_search_state() {
         } catch (...) { (void)cudaFree(mismatch); throw; }
         check_cuda(cudaFree(mismatch));
         std::cout << "[DOC_ORDER_ONEBIT] tokens="<<n<<" replica_bytes="<<n*20
-                  <<" full_payload_bitwise=passed initialization_only=1"<<std::endl;
+                  <<" full_payload_bitwise=passed initialization_only=1 build_verify_ms="
+                  <<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-replica_begin).count()
+                  <<std::endl;
     }
 
     if (uses_flat_centroid_route(options_.algorithm_variant)) {
