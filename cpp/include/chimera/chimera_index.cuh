@@ -69,7 +69,7 @@ inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == Algorithm
 enum class CagraMemoryPlacement { Device, AtsDataset, AtsDatasetAndGraph };
 // Existing cuVS search implementations; this only controls host dispatch.
 enum class CagraSearchAlgorithm { Auto = 100, SingleCta = 0, MultiCta = 1, MultiKernel = 2 };
-enum class FusedTokenDocumentLayout { Grouped, Interleaved, Cached, Warp4Doc, TensorPadded, TensorPaddedMax4 };
+enum class FusedTokenDocumentLayout { Grouped, Interleaved, Cached, Warp4Doc, TensorPadded, TensorPaddedMax4, TensorPaddedHoist };
 inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout layout) {
     switch (layout) {
         case FusedTokenDocumentLayout::Grouped: return "grouped";
@@ -78,6 +78,7 @@ inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout lay
         case FusedTokenDocumentLayout::Warp4Doc: return "warp4doc";
         case FusedTokenDocumentLayout::TensorPadded: return "tensor-padded";
         case FusedTokenDocumentLayout::TensorPaddedMax4: return "tensor-padded-max4";
+        case FusedTokenDocumentLayout::TensorPaddedHoist: return "tensor-padded-hoist";
         default: throw std::invalid_argument("Unknown fused token/document layout");
     }
 }
@@ -89,7 +90,8 @@ int partial_topk_cub_version() noexcept;
 // Tensor layouts share the finite FP16-input domain and half-scalar QA contract.
 inline bool is_tensor_token_document_layout(FusedTokenDocumentLayout layout) noexcept {
     return layout == FusedTokenDocumentLayout::TensorPadded ||
-           layout == FusedTokenDocumentLayout::TensorPaddedMax4;
+           layout == FusedTokenDocumentLayout::TensorPaddedMax4 ||
+           layout == FusedTokenDocumentLayout::TensorPaddedHoist;
 }
 
 struct SearchOptions {

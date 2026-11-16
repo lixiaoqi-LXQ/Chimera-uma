@@ -119,8 +119,8 @@ int main(int argc,char** argv) try {
                 << "  [--partial-topk] (custom stage, GPU candidate refinement; stable IDs/scorebits, k-refine<=1000)\n"
                 << "  [--split-token-score] (custom stage, excludes compact/fused/CPU document)\n"
                 << "  [--fused-token-document --fused-token-document-threads 128|256] (custom stage, chunks1)\n"
-                << "  [--fused-token-document-layout grouped|interleaved|cached|warp4doc|tensor-padded|tensor-padded-max4] (requires fused scoring; warp4doc/Tensor layouts require 128 threads)\n"
-                << "    tensor-padded and tensor-padded-max4: FP16-input/FP32-accum; requires doc-order+UMA/chunks1; final fullbit stays original FP32\n"
+                << "  [--fused-token-document-layout grouped|interleaved|cached|warp4doc|tensor-padded|tensor-padded-max4|tensor-padded-hoist] (requires fused scoring; warp4doc/Tensor layouts require 128 threads)\n"
+                << "    Tensor layouts: FP16-input/FP32-accum; require doc-order+UMA/chunks1; final fullbit stays original FP32\n"
                 << "  [--fused-direct-docs] (requires fused+doc-order+UMA, grouped|warp4doc|Tensor layout, chunks1, no CPU refine)\n"
                 << "  [--verify-full-bit --limit N --batch-only --profile-range]\n"
                 << "Native B1 and batch are both measured unless --batch-only is selected.\n"
@@ -142,6 +142,7 @@ int main(int argc,char** argv) try {
             else if(value=="warp4doc") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::Warp4Doc;
             else if(value=="tensor-padded") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::TensorPadded;
             else if(value=="tensor-padded-max4") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::TensorPaddedMax4;
+            else if(value=="tensor-padded-hoist") options.fused_token_document_layout=Chimera::FusedTokenDocumentLayout::TensorPaddedHoist;
             else throw std::invalid_argument("Unknown fused token/document layout");
             explicit_fused_layout=true;custom_backend_switch=true;
         }
