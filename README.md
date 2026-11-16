@@ -175,5 +175,9 @@ query for max reduction. See [source/validation scope](tensor-padded-max4.md).
 `tensor-padded-hoist` caches the eight A fragments before the token-tile loop
 and shares query/bits storage while retaining the original warp0 maximum.
 See [source and validation scope](tensor-padded-hoist.md).
+
+`tensor-padded-decode` caches selected code words and broadcasts within each
+warp; `tensor-padded-hoist-decode` combines that decode with A hoisting.
+See [source and validation scope](tensor-padded-decode.md).
 The default layout remains `grouped`; this candidate has no accepted performance
 result. The legacy Python adapter does not expose the experimental layout options.

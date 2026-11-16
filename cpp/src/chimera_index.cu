@@ -61,7 +61,9 @@ void chimera_index::validate_search_options(const SearchOptions& options) {
         case FusedTokenDocumentLayout::Warp4Doc:
         case FusedTokenDocumentLayout::TensorPadded:
         case FusedTokenDocumentLayout::TensorPaddedMax4:
-        case FusedTokenDocumentLayout::TensorPaddedHoist: break;
+        case FusedTokenDocumentLayout::TensorPaddedHoist:
+        case FusedTokenDocumentLayout::TensorPaddedDecode:
+        case FusedTokenDocumentLayout::TensorPaddedHoistDecode: break;
         default: throw std::invalid_argument("Unknown fused token/document layout");
     }
     if (is_tensor_token_document_layout(options.fused_token_document_layout) &&
