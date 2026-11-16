@@ -120,6 +120,9 @@ void chimera_index::validate_search_options(const SearchOptions& options) {
         options.cagra_thread_block_size != 128 && options.cagra_thread_block_size != 256 &&
         options.cagra_thread_block_size != 512 && options.cagra_thread_block_size != 1024)
         throw std::invalid_argument("CAGRA block size must be 0, 64, 128, 256, 512 or 1024");
+    if (options.cagra_hashmap_min_bitlen != 0 &&
+        (options.cagra_hashmap_min_bitlen < 8 || options.cagra_hashmap_min_bitlen > 20))
+        throw std::invalid_argument("CAGRA hashmap minimum bit length must be 0 or 8..20");
     if (options.cagra_search_width < 1)
         throw std::invalid_argument("CAGRA search width must be positive");
     // cuVS 26.04's actual SINGLE_CTA implementation supports <=512, even

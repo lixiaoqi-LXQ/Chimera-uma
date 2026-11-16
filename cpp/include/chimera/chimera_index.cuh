@@ -93,6 +93,7 @@ struct SearchOptions {
     int cagra_team_size = 0;
     int cagra_thread_block_size = 0;
     int cagra_search_width = 1;
+    int cagra_hashmap_min_bitlen = 0;  // Custom search: 0 keeps cuVS default; explicit 8..20 sets its lower bound.
     int num_chunks = 5;
     bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.

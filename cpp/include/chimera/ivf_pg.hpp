@@ -46,7 +46,8 @@ struct PG_CAGRA {
         CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
-        size_t cagra_search_width = 1);
+        size_t cagra_search_width = 1,
+        size_t cagra_hashmap_min_bitlen = 0);
     void search_centroids(
         const raft::resources& res,
         const float* d_queries,
@@ -59,7 +60,8 @@ struct PG_CAGRA {
         CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
-        size_t cagra_search_width = 1);
+        size_t cagra_search_width = 1,
+        size_t cagra_hashmap_min_bitlen = 0);
     void save(const std::string& graph_path) const;
     void load(const std::string& graph_path);
 };
@@ -86,7 +88,8 @@ struct IVF_PG {
         CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
-        size_t cagra_search_width = 1);
+        size_t cagra_search_width = 1,
+        size_t cagra_hashmap_min_bitlen = 0);
     void search_centroids(
         const raft::resources& res,
         const float* d_queries,
@@ -99,7 +102,8 @@ struct IVF_PG {
         CagraSearchAlgorithm cagra_algo = CagraSearchAlgorithm::Auto,
         size_t cagra_team_size = 0,
         size_t cagra_thread_block_size = 0,
-        size_t cagra_search_width = 1);
+        size_t cagra_search_width = 1,
+        size_t cagra_hashmap_min_bitlen = 0);
 
     void build_from_assignments(const uint32_t* list_nos, size_t n_vectors);
     int max_cluster_size() const;

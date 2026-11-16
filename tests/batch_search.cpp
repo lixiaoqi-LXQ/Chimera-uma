@@ -112,6 +112,7 @@ int main(int argc,char** argv) try {
                 << "  [--topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64]\n"
                 << "  [--cagra-algo auto|single-cta|multi-cta|multi-kernel]\n"
                 << "  [--cagra-team-size 0|4|8|16|32 --cagra-thread-block-size 0|64|128|256|512|1024 --cagra-search-width N]\n"
+                << "  [--cagra-hashmap-min-bitlen 0|8..20] (custom stage only; 0 keeps cuVS default)\n"
                 << "  [--split-token-score] (custom stage, excludes compact/fused/CPU document)\n"
                 << "  [--fused-token-document --fused-token-document-threads 128|256] (custom stage, chunks1)\n"
                 << "  [--fused-token-document-layout grouped|interleaved|cached|warp4doc|tensor-padded] (requires fused scoring; warp4doc/tensor-padded requires 128 threads)\n"
@@ -154,6 +155,12 @@ int main(int argc,char** argv) try {
         else if(arg=="--cagra-team-size") options.cagra_team_size=std::stoi(value);
         else if(arg=="--cagra-thread-block-size") options.cagra_thread_block_size=std::stoi(value);
         else if(arg=="--cagra-search-width") options.cagra_search_width=std::stoi(value);
+        else if(arg=="--cagra-hashmap-min-bitlen") {
+            size_t consumed = 0;
+            options.cagra_hashmap_min_bitlen = std::stoi(value, &consumed);
+            if (consumed != value.size()) throw std::invalid_argument("CAGRA hashmap minimum bit length requires an integer");
+            custom_backend_switch = true;
+        }
         else if(arg=="--cagra-memory") {
             cagra_memory=value;
             if(value=="device") options.cagra_memory_placement=Chimera::CagraMemoryPlacement::Device;
@@ -176,6 +183,9 @@ int main(int argc,char** argv) try {
         else throw std::invalid_argument("Unknown option "+arg);
     }
     // Reject invalid feature contracts before query-file reads/index loading.
+    if (options.cagra_hashmap_min_bitlen != 0 &&
+        (options.cagra_hashmap_min_bitlen < 8 || options.cagra_hashmap_min_bitlen > 20))
+        throw std::invalid_argument("CAGRA hashmap minimum bit length must be 0 or 8..20");
     if (options.fused_token_document_threads != 128 && options.fused_token_document_threads != 256)
         throw std::invalid_argument("Fused token/document CTA size must be 128 or 256");
     if (options.fused_token_document_layout == Chimera::FusedTokenDocumentLayout::TensorPadded &&
@@ -259,6 +269,7 @@ int main(int argc,char** argv) try {
         <<",\"cagra_team_size\":"<<options.cagra_team_size
         <<",\"cagra_thread_block_size\":"<<options.cagra_thread_block_size
         <<",\"cagra_search_width\":"<<options.cagra_search_width
+        <<",\"cagra_hashmap_min_bitlen\":"<<options.cagra_hashmap_min_bitlen
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
         <<",\"doc_order_onebit\":"<<(options.doc_order_onebit?"true":"false")
         <<",\"fused_token_document\":"<<(options.fused_token_document?"true":"false")

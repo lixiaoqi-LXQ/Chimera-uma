@@ -25,7 +25,8 @@ inline void apply_evolution_stage(EvolutionStage stage, SearchOptions& options) 
         options.fused_token_document_layout != FusedTokenDocumentLayout::Grouped ||
         options.split_token_score || options.compact_token_score || options.fast_document_reduce ||
         options.uma_query_buffers || options.uma_cpu_candidates || options.uma_cpu_refine ||
-        options.cagra_memory_placement != CagraMemoryPlacement::Device)
+        options.cagra_memory_placement != CagraMemoryPlacement::Device ||
+        options.cagra_hashmap_min_bitlen != 0)
         throw std::invalid_argument("Archived side optimizations are disabled in the three evolution stages");
     if (options.uma_cpu_document || options.uma_cpu_fullbit_deferred ||
         options.uma_cpu_fullbit_fraction != 0.0)

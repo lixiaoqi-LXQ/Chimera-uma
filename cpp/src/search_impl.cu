@@ -189,7 +189,8 @@ void chimera_index::generate_and_refine_candidates(
         options_.cagra_algo,
         static_cast<size_t>(options_.cagra_team_size),
         static_cast<size_t>(options_.cagra_thread_block_size),
-        static_cast<size_t>(options_.cagra_search_width));
+        static_cast<size_t>(options_.cagra_search_width),
+        static_cast<size_t>(options_.cagra_hashmap_min_bitlen));
     }
     }
 

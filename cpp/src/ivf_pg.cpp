@@ -160,11 +160,12 @@ void PG_CAGRA::search_centroids(
     CagraSearchAlgorithm cagra_algo,
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
-    size_t cagra_search_width) {
+    size_t cagra_search_width,
+    size_t cagra_hashmap_min_bitlen) {
     search_centroids(
         res_, d_queries, n_queries, nprobe, d_dists, d_labels, stream,
         cagra_itopk_size, cagra_algo, cagra_team_size,
-        cagra_thread_block_size, cagra_search_width);
+        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen);
 }
 
 void PG_CAGRA::search_centroids(
@@ -179,7 +180,11 @@ void PG_CAGRA::search_centroids(
     CagraSearchAlgorithm cagra_algo,
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
-    size_t cagra_search_width) {
+    size_t cagra_search_width,
+    size_t cagra_hashmap_min_bitlen) {
+    if (cagra_hashmap_min_bitlen != 0 &&
+        (cagra_hashmap_min_bitlen < 8 || cagra_hashmap_min_bitlen > 20))
+        throw std::invalid_argument("CAGRA hashmap minimum bit length must be 0 or 8..20");
     raft::resource::set_cuda_stream(res, rmm::cuda_stream_view(stream));
 
     auto queries = raft::make_device_matrix_view(
@@ -207,6 +212,7 @@ void PG_CAGRA::search_centroids(
     search_params.team_size = cagra_team_size;
     search_params.thread_block_size = cagra_thread_block_size;
     search_params.search_width = cagra_search_width;
+    search_params.hashmap_min_bitlen = cagra_hashmap_min_bitlen;
     cuvs::neighbors::cagra::search(
         res, search_params, *index_cagra, queries, labels, distances);
 }
@@ -243,11 +249,12 @@ void IVF_PG::search_centroids(
     CagraSearchAlgorithm cagra_algo,
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
-    size_t cagra_search_width) {
+    size_t cagra_search_width,
+    size_t cagra_hashmap_min_bitlen) {
     pg_index->search_centroids(
         d_queries, n_queries, nprobe, d_dists, d_labels, stream,
         cagra_itopk_size, cagra_algo, cagra_team_size,
-        cagra_thread_block_size, cagra_search_width);
+        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen);
 }
 
 void IVF_PG::search_centroids(
@@ -262,11 +269,12 @@ void IVF_PG::search_centroids(
     CagraSearchAlgorithm cagra_algo,
     size_t cagra_team_size,
     size_t cagra_thread_block_size,
-    size_t cagra_search_width) {
+    size_t cagra_search_width,
+    size_t cagra_hashmap_min_bitlen) {
     pg_index->search_centroids(
         res, d_queries, n_queries, nprobe, d_dists, d_labels, stream,
         cagra_itopk_size, cagra_algo, cagra_team_size,
-        cagra_thread_block_size, cagra_search_width);
+        cagra_thread_block_size, cagra_search_width, cagra_hashmap_min_bitlen);
 }
 
 void IVF_PG::build_from_assignments(const uint32_t* list_nos, size_t n_vectors) {
