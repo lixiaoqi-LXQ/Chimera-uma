@@ -12,6 +12,7 @@
 #include "chimera/ivf_pg.hpp"
 #include "chimera/quantization.hpp"
 #include "chimera_index_internal.cuh"
+#include "doc_order_onebit.cuh"
 #include "cpu_task_pool.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 
@@ -36,6 +37,18 @@
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    if (options.split_token_score &&
+        (options.compact_token_score || options.fused_token_document || options.uma_cpu_document))
+        throw std::invalid_argument("Split token scoring cannot combine compact token, fused token/document or CPU document scoring");
+    if (options.fused_token_document_threads != 128 && options.fused_token_document_threads != 256)
+        throw std::invalid_argument("Fused token/document CTA size must be 128 or 256");
+    if (!options.fused_token_document && options.fused_token_document_threads != 128)
+        throw std::invalid_argument("Fused token/document CTA selection requires fused scoring");
+    if (options.fused_token_document && options.num_chunks != 1)
+        throw std::invalid_argument("Fused token/document scoring requires chunks=1");
+    if (options.fused_token_document &&
+        (options.uma_cpu_document || options.fast_document_reduce || options.compact_token_score))
+        throw std::invalid_argument("Fused token/document scoring cannot combine CPU document, fast document or compact token scoring");
     if (!std::isfinite(options.uma_cpu_fullbit_fraction) ||
         options.uma_cpu_fullbit_fraction < 0 || options.uma_cpu_fullbit_fraction > 1)
         throw std::invalid_argument("UMA CPU fullbit fraction must be in [0,1]");
@@ -408,6 +421,33 @@ void chimera_index::initialize_search_state() {
                               n * sizeof(uint32_t), cudaMemcpyHostToDevice));
     }
 
+    if (options_.doc_order_onebit) {
+        static_assert(PADDED_DIM == 128, "Document-order replica expects D128/16B codes");
+        check_cuda(cudaMalloc(&d_doc_order_onebit_codes_, n*16));
+        check_cuda(cudaMalloc(&d_doc_order_onebit_factors_, n*sizeof(float)));
+        const int blocks=int(std::min(size_t(65535),(n+255)/256));
+        doc_order_detail::reorder<<<blocks,256>>>(
+            reinterpret_cast<const uint4*>(d_clustered_one_bit_codes_),
+            d_clustered_one_bit_factors_,d_token_to_cluster_pos_,
+            reinterpret_cast<uint4*>(d_doc_order_onebit_codes_),d_doc_order_onebit_factors_,n);
+        check_cuda(cudaGetLastError());
+        unsigned* mismatch=nullptr;
+        check_cuda(cudaMalloc(&mismatch,sizeof(unsigned)));
+        try {
+            check_cuda(cudaMemset(mismatch,0,sizeof(unsigned)));
+            doc_order_detail::verify<<<blocks,256>>>(
+                reinterpret_cast<const uint4*>(d_clustered_one_bit_codes_),
+                d_clustered_one_bit_factors_,d_token_to_cluster_pos_,
+                reinterpret_cast<const uint4*>(d_doc_order_onebit_codes_),d_doc_order_onebit_factors_,n,mismatch);
+            check_cuda(cudaGetLastError());
+            unsigned bad=0; check_cuda(cudaMemcpy(&bad,mismatch,sizeof(bad),cudaMemcpyDeviceToHost));
+            if(bad) throw std::runtime_error("Document-order onebit full payload verification failed");
+        } catch (...) { (void)cudaFree(mismatch); throw; }
+        check_cuda(cudaFree(mismatch));
+        std::cout << "[DOC_ORDER_ONEBIT] tokens="<<n<<" replica_bytes="<<n*20
+                  <<" full_payload_bitwise=passed initialization_only=1"<<std::endl;
+    }
+
     if (uses_flat_centroid_route(options_.algorithm_variant)) {
         if (!options_.expected_coarse_clusters || n_clusters != options_.expected_coarse_clusters)
             throw std::invalid_argument("Flat algorithm ablation requires the explicitly declared coarse cluster count");
@@ -499,6 +539,8 @@ void chimera_index::prepare_batch(size_t workers) {
         worker->d_doc_ptrs_ = d_doc_ptrs_;
         worker->d_cluster_pos_ = d_cluster_pos_;
         worker->d_clustered_one_bit_codes_ = d_clustered_one_bit_codes_;
+        worker->d_doc_order_onebit_codes_ = d_doc_order_onebit_codes_;
+        worker->d_doc_order_onebit_factors_ = d_doc_order_onebit_factors_;
         worker->d_clustered_one_bit_factors_ = d_clustered_one_bit_factors_;
         worker->d_clustered_doc_ids_ = d_clustered_doc_ids_;
         worker->d_token_to_cluster_pos_ = d_token_to_cluster_pos_;

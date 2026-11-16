@@ -548,7 +548,8 @@ void chimera_index::allocate_workspace() {
         check_cuda(cudaMallocHost(&ws_->h_num_refined_tokens, sizeof(size_t)));
     }
 
-    if ((options_.fast_document_reduce || ws_->cpu_document_enabled) && options_.verify_full_bit) {
+    if ((options_.split_token_score || options_.fast_document_reduce || options_.fused_token_document ||
+         ws_->cpu_document_enabled) && options_.verify_full_bit) {
         check_cuda(cudaMalloc(&ws_->d_document_reduce_reference,
                               ws_->max_refined_candidates * sizeof(float)));
         check_cuda(cudaMallocHost(&ws_->h_document_reduce_reference,
@@ -654,6 +655,8 @@ void chimera_index::release_resources() noexcept {
     (void)cudaFree(d_doc_ptrs_);
     (void)cudaFree(d_cluster_pos_);
     (void)cudaFree(d_clustered_one_bit_codes_);
+    (void)cudaFree(d_doc_order_onebit_codes_);
+    (void)cudaFree(d_doc_order_onebit_factors_);
     (void)cudaFree(d_clustered_one_bit_factors_);
     if (h_uma_clustered_doc_ids_) std::free(h_uma_clustered_doc_ids_);
     else (void)cudaFree(d_clustered_doc_ids_);
@@ -726,6 +729,8 @@ void chimera_index::release_resources() noexcept {
     d_doc_ptrs_ = nullptr;
     d_cluster_pos_ = nullptr;
     d_clustered_one_bit_codes_ = nullptr;
+    d_doc_order_onebit_codes_ = nullptr;
+    d_doc_order_onebit_factors_ = nullptr;
     d_clustered_one_bit_factors_ = nullptr;
     d_clustered_doc_ids_ = nullptr;
     d_token_to_cluster_pos_ = nullptr;

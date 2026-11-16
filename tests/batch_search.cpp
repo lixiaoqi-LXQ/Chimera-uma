@@ -80,13 +80,16 @@ int main(int argc,char** argv) try {
     bool batch_only=false, profile_range=false;
     std::string cagra_memory="device", cagra_algo="auto";
     std::string stage_name="custom";
-    bool custom_backend_switch=false, explicit_workers=false;
+    bool custom_backend_switch=false, explicit_workers=false, explicit_fused_threads=false;
     Chimera::SearchOptions options;
     options.nprobe=32; options.k_refine=1000; options.k_full_bit=20;
     options.cagra_itopk_size=64; options.num_chunks=1;
     for(int i=1;i<argc;++i) {
         std::string arg=argv[i];
         if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;custom_backend_switch=true;continue; }
+        if(arg=="--doc-order-onebit") { options.doc_order_onebit=true;custom_backend_switch=true;continue; }
+        if(arg=="--fused-token-document") { options.fused_token_document=true;custom_backend_switch=true;continue; }
+        if(arg=="--split-token-score") { options.split_token_score=true;custom_backend_switch=true;continue; }
         if(arg=="--compact-token-score") { options.compact_token_score=true;continue; }
         if(arg=="--fast-document-reduce") { options.fast_document_reduce=true;continue; }
         if(arg=="--uma-cpu-refine") { options.uma_cpu_refine=true; options.uma_cpu_candidates=true; options.uma_query_buffers=true;continue; }
@@ -108,6 +111,8 @@ int main(int argc,char** argv) try {
                 << "  [--topk 10 --nprobe 32 --k-refine 1000 --k-full-bit 20 --itopk 64]\n"
                 << "  [--cagra-algo auto|single-cta|multi-cta|multi-kernel]\n"
                 << "  [--cagra-team-size 0|4|8|16|32 --cagra-thread-block-size 0|64|128|256|512|1024 --cagra-search-width N]\n"
+                << "  [--split-token-score] (custom stage, excludes compact/fused/CPU document)\n"
+                << "  [--fused-token-document --fused-token-document-threads 128|256] (custom stage, chunks1)\n"
                 << "  [--verify-full-bit --limit N --batch-only --profile-range]\n"
                 << "Native B1 and batch are both measured unless --batch-only is selected.\n"
                 << "Named stages exclude archived GPU-kernel and UMA-buffer experiments.\n"
@@ -121,6 +126,10 @@ int main(int argc,char** argv) try {
         else if(arg=="--output")output_path=value;
         else if(arg=="--workers") { worker_list=value;explicit_workers=true; }
         else if(arg=="--stage")stage_name=value;
+        else if(arg=="--fused-token-document-threads") {
+            options.fused_token_document_threads=std::stoi(value);
+            explicit_fused_threads=true;custom_backend_switch=true;
+        }
         else if(arg=="--cagra-algo") {
             cagra_algo=value;
             if(value=="auto") options.cagra_algo=Chimera::CagraSearchAlgorithm::Auto;
@@ -153,6 +162,8 @@ int main(int argc,char** argv) try {
         else if(arg=="--uma-cpu-pool-cpus") { options.uma_cpu_pool_cpus=value;custom_backend_switch=true; }
         else throw std::invalid_argument("Unknown option "+arg);
     }
+    if (explicit_fused_threads && !options.fused_token_document)
+        throw std::invalid_argument("--fused-token-document-threads requires --fused-token-document");
     const auto stage=Chimera::parse_evolution_stage(stage_name);
     if(stage!=Chimera::EvolutionStage::Custom) {
         if(custom_backend_switch)throw std::invalid_argument("Do not mix --stage with custom CPU backend/pool switches");
@@ -211,6 +222,10 @@ int main(int argc,char** argv) try {
         <<",\"cagra_thread_block_size\":"<<options.cagra_thread_block_size
         <<",\"cagra_search_width\":"<<options.cagra_search_width
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
+        <<",\"doc_order_onebit\":"<<(options.doc_order_onebit?"true":"false")
+        <<",\"fused_token_document\":"<<(options.fused_token_document?"true":"false")
+        <<",\"fused_token_document_threads\":"<<options.fused_token_document_threads
+        <<",\"split_token_score\":"<<(options.split_token_score?"true":"false")
         <<",\"compact_token_score\":"<<(options.compact_token_score?"true":"false")
         <<",\"fast_document_reduce\":"<<(options.fast_document_reduce?"true":"false")
         <<",\"cagra_memory\":\""<<cagra_memory<<"\""

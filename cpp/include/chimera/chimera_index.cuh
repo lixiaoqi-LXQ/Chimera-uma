@@ -85,6 +85,10 @@ struct SearchOptions {
     int num_chunks = 5;
     bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
+    bool doc_order_onebit = false;  // Optional document-order replica, built and verified once at load.
+    bool fused_token_document = false;  // Opt-in Q8 groups, small query-max scratch, then original-order sum.
+    int fused_token_document_threads = 128;  // Supported CTA sizes: 128 or 256.
+    bool split_token_score = false;  // Opt-in independent Q8 CTA groups, original score matrix.
     bool compact_token_score = false;  // Independent opt-in bounded-register token scorer.
     bool fast_document_reduce = false;  // Independent opt-in GPU warp document reduction.
     bool uma_cpu_refine = false;  // CPU exact stable-radix-equivalent top-k.
@@ -368,6 +372,8 @@ class chimera_index {
     int* d_doc_ptrs_ = nullptr;
     size_t* d_cluster_pos_ = nullptr;
     char* d_clustered_one_bit_codes_ = nullptr;
+    char* d_doc_order_onebit_codes_ = nullptr;
+    float* d_doc_order_onebit_factors_ = nullptr;
     float* d_clustered_one_bit_factors_ = nullptr;
     int* d_clustered_doc_ids_ = nullptr;
     int* h_uma_clustered_doc_ids_ = nullptr;  // Corpus owner only; d_ aliases this ATS allocation.

@@ -18,6 +18,9 @@
 #include "chimera/ivf_pg.hpp"
 #include "chimera/kernels.cuh"
 #include "chimera_index_internal.cuh"
+#include "doc_order_onebit.cuh"
+#include "fused_token_document.cuh"
+#include "split_token_score.cuh"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
 
@@ -507,6 +510,11 @@ void chimera_index::collaborative_document_scoring(
         }
     }
 
+    if(options_.doc_order_onebit) {
+        doc_order_detail::gather_positions<<<num_refined_candidates,256,0,stream>>>(
+            refined_ids,d_doc_ptrs_,ws_->d_refined_doc_offsets,
+            ws_->d_refined_token_positions,num_refined_candidates);
+    } else {
     gather_refined_token_positions_kernel<<<
         num_refined_candidates, 256, 0, stream>>>(
         refined_ids,
@@ -516,6 +524,7 @@ void chimera_index::collaborative_document_scoring(
         ws_->d_refined_token_positions,
         num_refined_candidates
     );
+    }
     check_cuda(cudaGetLastError());
 
     if (!ws_->uma_query_buffers) {
@@ -583,17 +592,84 @@ void chimera_index::collaborative_document_scoring(
             ws_->h_pinned_refined_doc_offsets[chunk_end];
         const size_t token_count = token_end - token_start;
 
+        if (options_.fused_token_document) {
+            // chunks1 keeps these offsets and token positions relative to the
+            // full query. Reuse only the first docs*32 floats as query-max
+            // scratch; finalsum consumes it before an optional oracle rewrites
+            // the same allocation as the full token matrix below.
+            if (num_chunks != 1 || chunk_start != 0 || token_start != 0 ||
+                static_cast<size_t>(chunk_count) > ws_->max_refined_tokens)
+                throw std::runtime_error("Fused token/document scratch or chunks contract differs");
+            const auto* codes = reinterpret_cast<const uint4*>(options_.doc_order_onebit
+                ? d_doc_order_onebit_codes_ : d_clustered_one_bit_codes_);
+            const float* factors = options_.doc_order_onebit
+                ? d_doc_order_onebit_factors_ : d_clustered_one_bit_factors_;
+            if (chunk_count > 0) {
+                const dim3 fused_grid(static_cast<unsigned>(chunk_count), 4);
+                const int threads = options_.fused_token_document_threads;
+                const size_t shared_bytes = (4104 + (threads / 32) * 8) * sizeof(float);
+                if (threads == 128) {
+                    fused_token_document_detail::fused_token_doc_groups<128><<<
+                        fused_grid, 128, shared_bytes, stream>>>(
+                        ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                        ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                        ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                } else {
+                    fused_token_document_detail::fused_token_doc_groups<256><<<
+                        fused_grid, 256, shared_bytes, stream>>>(
+                        ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                        ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                        ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                }
+                check_cuda(cudaGetLastError());
+                fused_token_document_detail::fused_document_sum<<<chunk_count, 32, 0, stream>>>(
+                    ws_->d_one_bit_token_scores, ws_->d_one_bit_document_scores,
+                    static_cast<size_t>(chunk_count));
+                check_cuda(cudaGetLastError());
+                if (options_.verify_full_bit) {
+                    if (!ws_->d_document_reduce_reference || !ws_->h_document_reduce_reference)
+                        throw std::runtime_error("Missing fused token/document oracle buffers");
+                    if (token_count > 0) {
+                        const int token_blocks = static_cast<int>((token_count + 255) / 256);
+                        const size_t reference_shared =
+                            (DOCUMENT_SCORING_LUT_SMEM_FLOATS + DOCUMENT_SCORING_LUT_TILE_Q) * sizeof(float);
+                        one_bit_token_score_kernel<<<token_blocks, 256, reference_shared, stream>>>(
+                            ws_->d_lut, reinterpret_cast<const char*>(codes), factors,
+                            ws_->d_cb1_sumq, ws_->d_refined_token_positions,
+                            ws_->d_one_bit_token_scores, total_tokens, token_count);
+                        check_cuda(cudaGetLastError());
+                    }
+                    one_bit_document_score_kernel<<<chunk_count, score_threads, 0, stream>>>(
+                        ws_->d_one_bit_token_scores, ws_->d_refined_doc_offsets,
+                        ws_->d_document_reduce_reference, total_tokens, chunk_count);
+                    check_cuda(cudaGetLastError());
+                    check_cuda(cudaMemcpyAsync(
+                        ws_->h_document_reduce_reference, ws_->d_document_reduce_reference,
+                        chunk_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                }
+            }
+        } else {
         if (token_count > 0) {
             const int token_blocks = (token_count + 255) / 256;
             const size_t lut_shared_memory =
                 DOCUMENT_SCORING_LUT_SMEM_FLOATS * sizeof(float) +
                 DOCUMENT_SCORING_LUT_TILE_Q * sizeof(float);
-            if (options_.compact_token_score) {
+            if (options_.split_token_score) {
+                split_token_score_detail::token_split_query_group<8><<<
+                    dim3(token_blocks, 4), 256, lut_shared_memory, stream>>>(
+                    ws_->d_lut,
+                    options_.doc_order_onebit ? d_doc_order_onebit_codes_ : d_clustered_one_bit_codes_,
+                    options_.doc_order_onebit ? d_doc_order_onebit_factors_ : d_clustered_one_bit_factors_,
+                    ws_->d_cb1_sumq,
+                    ws_->d_refined_token_positions + token_start,
+                    ws_->d_one_bit_token_scores + token_start,
+                    total_tokens, token_count);
+            } else if (options_.compact_token_score) {
                 one_bit_token_score_compact_kernel<<<
                 token_blocks, 256, lut_shared_memory, stream>>>(
                 ws_->d_lut,
-                d_clustered_one_bit_codes_,
-                d_clustered_one_bit_factors_,
+                options_.doc_order_onebit ? d_doc_order_onebit_codes_ : d_clustered_one_bit_codes_,
+                options_.doc_order_onebit ? d_doc_order_onebit_factors_ : d_clustered_one_bit_factors_,
                 ws_->d_cb1_sumq,
                 ws_->d_refined_token_positions + token_start,
                 ws_->d_one_bit_token_scores + token_start,
@@ -603,8 +679,8 @@ void chimera_index::collaborative_document_scoring(
             one_bit_token_score_kernel<<<
                 token_blocks, 256, lut_shared_memory, stream>>>(
                 ws_->d_lut,
-                d_clustered_one_bit_codes_,
-                d_clustered_one_bit_factors_,
+                options_.doc_order_onebit ? d_doc_order_onebit_codes_ : d_clustered_one_bit_codes_,
+                options_.doc_order_onebit ? d_doc_order_onebit_factors_ : d_clustered_one_bit_factors_,
                 ws_->d_cb1_sumq,
                 ws_->d_refined_token_positions + token_start,
                 ws_->d_one_bit_token_scores + token_start,
@@ -635,7 +711,7 @@ void chimera_index::collaborative_document_scoring(
                     ws_->d_one_bit_document_scores + chunk_start,
                     total_tokens, chunk_count);
                 check_cuda(cudaGetLastError());
-                if (options_.verify_full_bit) {
+                if (options_.verify_full_bit && !options_.split_token_score) {
                     one_bit_document_score_kernel<<<chunk_count, score_threads, 0, stream>>>(
                         ws_->d_one_bit_token_scores,
                         ws_->d_refined_doc_offsets + chunk_start,
@@ -655,6 +731,36 @@ void chimera_index::collaborative_document_scoring(
                     total_tokens, chunk_count);
                 check_cuda(cudaGetLastError());
             }
+        }
+
+        if (options_.split_token_score && options_.verify_full_bit && chunk_count > 0) {
+            // The primary token + GPU document result is complete in this
+            // stream before reusing the token matrix for the original oracle.
+            // CPU document is rejected because it would still need that matrix.
+            if (!ws_->d_document_reduce_reference || !ws_->h_document_reduce_reference)
+                throw std::runtime_error("Missing split token score oracle buffers");
+            if (token_count > 0) {
+                const int reference_blocks = static_cast<int>((token_count + 255) / 256);
+                const size_t reference_shared =
+                    (DOCUMENT_SCORING_LUT_SMEM_FLOATS + DOCUMENT_SCORING_LUT_TILE_Q) * sizeof(float);
+                one_bit_token_score_kernel<<<reference_blocks, 256, reference_shared, stream>>>(
+                    ws_->d_lut,
+                    options_.doc_order_onebit ? d_doc_order_onebit_codes_ : d_clustered_one_bit_codes_,
+                    options_.doc_order_onebit ? d_doc_order_onebit_factors_ : d_clustered_one_bit_factors_,
+                    ws_->d_cb1_sumq, ws_->d_refined_token_positions + token_start,
+                    ws_->d_one_bit_token_scores + token_start, total_tokens, token_count);
+                check_cuda(cudaGetLastError());
+            }
+            one_bit_document_score_kernel<<<chunk_count, score_threads, 0, stream>>>(
+                ws_->d_one_bit_token_scores, ws_->d_refined_doc_offsets + chunk_start,
+                ws_->d_document_reduce_reference + chunk_start, total_tokens, chunk_count);
+            check_cuda(cudaGetLastError());
+            check_cuda(cudaMemcpyAsync(
+                ws_->h_document_reduce_reference + chunk_start,
+                ws_->d_document_reduce_reference + chunk_start,
+                chunk_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        }
+
         }
 
         check_cuda(cudaEventRecord(chunk_compute_done[chunk], stream));
@@ -719,7 +825,8 @@ void chimera_index::collaborative_document_scoring(
             group->wait();
         }
 
-        if ((options_.fast_document_reduce || ws_->cpu_document_enabled) && options_.verify_full_bit) {
+        if ((options_.split_token_score || options_.fast_document_reduce || options_.fused_token_document ||
+             ws_->cpu_document_enabled) && options_.verify_full_bit) {
             for (int i = chunk_start; i < chunk_end; ++i) {
                 if (std::memcmp(&ws_->h_document_reduce_reference[i],
                                 &ws_->h_mapped_one_bit_document_scores[i], sizeof(float))) {
@@ -727,9 +834,13 @@ void chimera_index::collaborative_document_scoring(
                                              std::to_string(i));
                 }
             }
-            std::cout << (ws_->cpu_document_enabled ? "[CPU_DOCUMENT_POOL_VERIFY] candidates="
-                                                   : "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=") << chunk_count
-                      << " scores_fp32_bitwise=passed\n";
+            std::cout << (options_.split_token_score ? "[SPLIT_TOKEN_SCORE_VERIFY] candidates="
+                            : options_.fused_token_document ? "[FUSED_TOKEN_DOCUMENT_VERIFY] candidates="
+                            : ws_->cpu_document_enabled ? "[CPU_DOCUMENT_POOL_VERIFY] candidates="
+                                                        : "[FAST_DOCUMENT_REDUCE_VERIFY] candidates=") << chunk_count;
+            if (options_.fused_token_document)
+                std::cout << " threads=" << options_.fused_token_document_threads;
+            std::cout << " scores_fp32_bitwise=passed\n";
         }
 
         int num_full_bit_candidates = 0;
