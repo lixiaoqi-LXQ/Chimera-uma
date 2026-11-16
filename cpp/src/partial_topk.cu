@@ -113,7 +113,7 @@ void PartialTopKWorkspace::reserve(size_t rows, size_t selected, bool verificati
         selected == 0 || selected > 1000)
         throw std::invalid_argument("Partial TopK requires int-sized positive N and 1..1000 selected capacity");
     if (row_capacity >= rows && selected_capacity >= selected &&
-        verification_storage == verification) return;
+        (!verification || verification_storage)) return;
     // Stage all allocations before changing a live lane. On failure the staged
     // owner's destructor releases only its allocations, preserving the old owner.
     PartialTopKWorkspace next;
@@ -145,7 +145,7 @@ void PartialTopKWorkspace::select(
 #else
     if (!scores || !original_ids || rows <= 0 || size_t(rows) > row_capacity ||
         count <= 0 || count > rows || size_t(count) > selected_capacity || count > 1000 ||
-        verification != verification_storage)
+        (verification && !verification_storage))
         throw std::logic_error("Partial TopK workspace/input extent mismatch");
     if (verification && (!oracle_input_rows || !selected_rows || !reference_temp ||
                          !reference_scores || !reference_ids))

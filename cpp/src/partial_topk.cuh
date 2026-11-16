@@ -34,7 +34,7 @@ struct PartialTopKWorkspace {
     size_t temporary_bytes = 0;
     size_t row_capacity = 0;
     size_t selected_capacity = 0;
-    bool verification_storage = false;
+    bool verification_storage = false;  // Allocated QA capability, retained when verification is disabled.
 };
 
 }  // namespace Chimera

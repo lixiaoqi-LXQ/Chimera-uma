@@ -33,7 +33,11 @@ Each `Workspace` has a noncopyable `PartialTopKWorkspace` owner. It reserves its
 input keys, K-result buffers and CUB temp when the existing candidate arena
 grows. New allocations are staged before swapping owners; failed allocation
 releases only the staged buffers. The selector itself allocates no device
-memory. QA row buffers exist only with `verify_full_bit=true`. Index cleanup
+memory. QA row buffers are allocated when `verify_full_bit=true` and remain
+available when `disable_diagnostic_candidate_verification()` turns validation
+off. Capacity-fit unverified queries reuse those buffers without allocation;
+both QA row-output pointers remain null on that path. Re-enabling verification
+without QA capacity requires reserve. Index cleanup
 drains the existing GPU work, then releases these private buffers before stream
 destruction; a later destructor release is harmless. Batch lanes never borrow
 the owner's TopK buffers.
