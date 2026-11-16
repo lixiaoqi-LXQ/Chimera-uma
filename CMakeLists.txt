@@ -66,6 +66,7 @@ add_library(chimera_core STATIC
     cpp/src/gpu_fullbit_scoring.cu
     cpp/src/flat_l2_router.cu
     cpp/src/search_impl.cu
+    cpp/src/partial_topk.cu
     cpp/src/utils.cu
 )
 target_include_directories(chimera_core PUBLIC

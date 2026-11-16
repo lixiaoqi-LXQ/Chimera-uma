@@ -88,6 +88,7 @@ int main(int argc,char** argv) try {
         std::string arg=argv[i];
         if(arg=="--cpu-full-bit") { options.gpu_full_bit=false;custom_backend_switch=true;continue; }
         if(arg=="--cagra-half") { options.cagra_half=true;custom_backend_switch=true;continue; }
+        if(arg=="--partial-topk") { options.partial_topk=true;custom_backend_switch=true;continue; }
         if(arg=="--doc-order-onebit") { options.doc_order_onebit=true;custom_backend_switch=true;continue; }
         if(arg=="--fused-token-document") { options.fused_token_document=true;custom_backend_switch=true;continue; }
         if(arg=="--fused-direct-docs") { options.fused_direct_docs=true;custom_backend_switch=true;continue; }
@@ -115,6 +116,7 @@ int main(int argc,char** argv) try {
                 << "  [--cagra-team-size 0|4|8|16|32 --cagra-thread-block-size 0|64|128|256|512|1024 --cagra-search-width N]\n"
                 << "  [--cagra-hashmap-min-bitlen 0|8..20] (custom stage only; 0 keeps cuVS default)\n"
                 << "  [--cagra-half] (custom stage, CAGRA device graph + UMA queries; FP16 routing inputs, unchanged original graph/FP32 fullbit)\n"
+                << "  [--partial-topk] (custom stage, GPU candidate refinement; stable IDs/scorebits, k-refine<=1000)\n"
                 << "  [--split-token-score] (custom stage, excludes compact/fused/CPU document)\n"
                 << "  [--fused-token-document --fused-token-document-threads 128|256] (custom stage, chunks1)\n"
                 << "  [--fused-token-document-layout grouped|interleaved|cached|warp4doc|tensor-padded] (requires fused scoring; warp4doc/tensor-padded requires 128 threads)\n"
@@ -299,6 +301,11 @@ int main(int argc,char** argv) try {
         <<",\"cagra_graph_alias_verified\":"<<(cagra_storage.graph_alias_verified?"true":"false")
         <<",\"cagra_source_float_dataset_retained\":"<<(cagra_storage.source_float_dataset_retained?"true":"false")
         <<",\"gpu_full_bit\":"<<(options.gpu_full_bit?"true":"false")
+        <<",\"partial_topk\":"<<(options.partial_topk?"true":"false")
+        <<",\"partial_topk_available\":"<<(Chimera::partial_topk_available()?"true":"false")
+        <<",\"partial_topk_cub_version\":"<<Chimera::partial_topk_cub_version()
+        <<",\"partial_score_selection\":\""<<(options.partial_topk?"packed64-cub-topk-stable-row":"cub-full-stable-radix-sort")<<"\""
+        <<",\"partial_selection_math\":\""<<(options.partial_topk?"fp32-scorebits/radix-exact/stable-row":"fp32-cub-stable-radix")<<"\""
         <<",\"doc_order_onebit\":"<<(options.doc_order_onebit?"true":"false")
         <<",\"fused_token_document\":"<<(options.fused_token_document?"true":"false")
         <<",\"fused_direct_docs\":"<<(options.fused_direct_docs?"true":"false")

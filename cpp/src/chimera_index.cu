@@ -37,6 +37,12 @@
 namespace Chimera {
 
 void chimera_index::validate_search_options(const SearchOptions& options) {
+    if (options.partial_topk && !partial_topk_available())
+        throw std::invalid_argument("Partial TopK requires a build with CUB >=3.3.0 and DeviceTopK; this build retains the original full sort");
+    if (options.partial_topk &&
+        (skips_candidate_refinement(options.algorithm_variant) || options.uma_cpu_refine ||
+         options.uma_cpu_candidates || options.k_refine < 1 || options.k_refine > 1000))
+        throw std::invalid_argument("Partial TopK requires GPU candidate generation/refinement and k_refine in 1..1000 (custom experiment)");
     if (options.cagra_half &&
         (!options.uma_query_buffers || uses_flat_centroid_route(options.algorithm_variant) ||
          options.cagra_memory_placement != CagraMemoryPlacement::Device))

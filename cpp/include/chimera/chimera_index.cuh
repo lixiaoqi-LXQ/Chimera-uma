@@ -81,6 +81,10 @@ inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout lay
     }
 }
 
+// Compiled library capability; these queries do not initialize CUDA.
+bool partial_topk_available() noexcept;
+int partial_topk_cub_version() noexcept;
+
 struct SearchOptions {
     AlgorithmVariant algorithm_variant = AlgorithmVariant::Full;
     CagraMemoryPlacement cagra_memory_placement = CagraMemoryPlacement::Device;
@@ -98,6 +102,7 @@ struct SearchOptions {
     int num_chunks = 5;
     bool gpu_full_bit = true;  // Chimera+: only the full-bit scoring backend changes.
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
+    bool partial_topk = false;  // Custom-only stable-equivalent GPU partial-score selection, k_refine<=1000.
     bool doc_order_onebit = false;  // Optional document-order replica, built and verified once at load.
     bool fused_token_document = false;  // Opt-in fusion; TensorPadded explicitly uses FP16 inputs, other layouts preserve FP32.
     bool fused_direct_docs = false;  // Grouped/warp4doc/TensorPadded read natural doc ranges; bypass refined metadata handoff.

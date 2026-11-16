@@ -327,6 +327,12 @@ void chimera_index::ensure_candidate_capacity(size_t required_rows) {
     bind_candidate_arena(
         d_candidate_arena_, grown_rows, score_buffer_capacity);
 
+    if (options_.partial_topk) {
+        // cudaFree above has completed the previous lane's arena users. Keep
+        // selector ownership private and reserve only as candidate capacity grows.
+        ws_->partial_topk.reserve(grown_rows, size_t(options_.k_refine), options_.verify_full_bit);
+    }
+
     candidate_capacity_ = grown_rows;
 }
 
@@ -689,6 +695,7 @@ void chimera_index::release_resources() noexcept {
     }
 
     if (ws_ != nullptr) {
+        ws_->partial_topk.release();
         release_gpu_full_bit();
         (void)cudaFree(ws_->d_document_reduce_reference);
         (void)cudaFreeHost(ws_->h_document_reduce_reference);

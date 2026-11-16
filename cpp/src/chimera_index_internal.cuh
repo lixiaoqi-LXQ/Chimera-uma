@@ -5,6 +5,7 @@
 
 #include "chimera/chimera_index.cuh"
 #include "chimera/flat_l2_router.cuh"
+#include "partial_topk.cuh"
 
 #include <numeric>
 #include <utility>
@@ -67,6 +68,7 @@ struct chimera_index::Workspace {
     void* d_cub_temp_storage = nullptr;
     size_t cub_temp_storage_bytes = 0;
     float* d_sorted_partial_scores = nullptr;
+    PartialTopKWorkspace partial_topk;  // Sole lane owner; no shared batch-owner buffers.
     int* d_candidate_doc_ids = nullptr;
     float* h_pinned_queries = nullptr;
     float* h_pinned_cb1_sumq = nullptr;

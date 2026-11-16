@@ -133,6 +133,8 @@ SearchCliArgs parse_search_args(int argc, char** argv) {
             args.load_options.low_memory = true;
         } else if (arg == "--profile-range") {
             args.profile_range = true;
+        } else if (arg == "--partial-topk") {
+            args.options.partial_topk = true;
         } else if (arg == "--output") {
             args.output_file = require_value(argc, argv, i, arg);
         } else if (arg == "--query" || arg == "-q") {
@@ -252,6 +254,7 @@ void print_search_help(const char* program) {
         << defaults.options.nprobe << "\n"
         << "  [--k-refine <count>]            Candidates retained after refinement. Default: "
         << defaults.options.k_refine << "\n"
+        << "  [--partial-topk]               Stable-equivalent GPU selection; k-refine<=1000, requires CUB>=3.3.\n"
         << "  [--k-full-bit <count>]          Candidates scored with full-bit codes. Default: "
         << defaults.options.k_full_bit << "\n"
         << "  [--cagra-itopk-size <count>]    CAGRA intermediate top-k. Default: "

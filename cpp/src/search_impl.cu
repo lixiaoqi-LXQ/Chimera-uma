@@ -436,6 +436,14 @@ void chimera_index::generate_and_refine_candidates(
             std::cout << "[UMA_REFINE_VERIFY] candidates=" << num_candidate_docs
                       << " selected=" << num_refined_candidates << " ids_scores_bitwise=passed\n";
         }
+    } else if (options_.partial_topk) {
+        ws_->partial_topk.select(partial_scores, ws_->d_candidate_doc_ids,
+            num_candidate_docs, num_refined_candidates, stream, options_.verify_full_bit,
+            ws_->d_cub_temp_storage, ws_->cub_temp_storage_bytes,
+            ws_->d_sorted_partial_scores, ws_->d_sorted_candidate_doc_ids);
+        check_cuda(cudaMemcpyAsync(ws_->d_candidate_doc_ids,
+            ws_->partial_topk.selected_ids(), size_t(num_refined_candidates) * sizeof(int),
+            cudaMemcpyDeviceToDevice, stream));
     } else {
     cub::DeviceRadixSort::SortPairsDescending(
         ws_->d_cub_temp_storage,

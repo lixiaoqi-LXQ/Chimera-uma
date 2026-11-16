@@ -103,7 +103,8 @@ int main(int argc, char** argv) {
     std::cout << "[ALGORITHM_ABLATION] kernel_mode=full variant=" << variant
               << " expected_coarse_clusters=" << args.options.expected_coarse_clusters
               << " route=" << (uses_flat_centroid_route(args.options.algorithm_variant) ? "exact_FP32_PEDANTIC_L2Expanded" : "original_CAGRA")
-              << " candidate_refinement=" << (skips_candidate_refinement(args.options.algorithm_variant) ? "bypassed_all_CG_documents" : "original_partial_sum_topK")
+              << " candidate_refinement=" << (skips_candidate_refinement(args.options.algorithm_variant) ? "bypassed_all_CG_documents" :
+                  args.options.partial_topk ? "partial_sum_packed64_stable_row_topK" : "original_partial_sum_topK")
               << " graph_storage=" << (uses_flat_centroid_route(args.options.algorithm_variant) ? "retained_dataset_container_not_queried" : "original") << '\n';
 
     size_t num_q = 0;
