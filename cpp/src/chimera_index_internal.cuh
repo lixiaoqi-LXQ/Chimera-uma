@@ -51,7 +51,7 @@ struct chimera_index::Workspace {
     float* d_one_bit_document_scores = nullptr;
     float* d_document_reduce_reference = nullptr;  // Diagnostic only.
     float* h_document_reduce_reference = nullptr;
-    // Private lane-owned diagnostics, allocated only for TensorPadded+verify.
+    // Private lane-owned diagnostics, allocated only for Tensor layouts+verify.
     float* d_tensor_querymax_capture = nullptr;
     float* h_tensor_querymax_capture = nullptr;
     double* d_tensor_half_reference = nullptr;

@@ -22,6 +22,7 @@
 #include "doc_order_onebit.cuh"
 #include "fused_token_document.cuh"
 #include "tensor_token_document.cuh"
+#include "tensor_token_document_max4.cuh"
 #include "tensor_document_verification.hpp"
 #include "split_token_score.cuh"
 #include "rabitqlib/utils/rotator.hpp"
@@ -109,7 +110,7 @@ std::vector<size_t> chimera_index::search_one(const float* queries, size_t k) {
                                     size_t(Q_DOCLEN) * PADDED_DIM))
         throw std::invalid_argument("CAGRA half rotated queries must be finite and within [-65504,65504]");
 
-    if (options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPadded &&
+    if (is_tensor_token_document_layout(options_.fused_token_document_layout) &&
         !tensor_token_document_detail::half_query_domain_valid(ws_->h_pinned_queries))
         throw std::invalid_argument("Tensor-padded rotated queries must be finite and within the FP16 range [-65504,65504]");
 
@@ -487,7 +488,7 @@ void chimera_index::collaborative_document_scoring(
     const int* refined_ids = options_.uma_cpu_refine
         ? ws_->h_refined_doc_ids : ws_->d_candidate_doc_ids;
     const bool direct_docs = options_.fused_direct_docs;
-    const bool tensor_layout = options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPadded;
+    const bool tensor_layout = is_tensor_token_document_layout(options_.fused_token_document_layout);
     // The old metadata path is retained only for ordinary scoring or an
     // explicit original-kernel oracle. The primary direct kernel still runs
     // during verification; only its reference needs materialized positions.
@@ -649,23 +650,40 @@ void chimera_index::collaborative_document_scoring(
                     : (4104 + (threads / 32) * 8) * sizeof(float);
                 if (tensor_layout) {
                     if (threads != 128 || !ws_->uma_query_buffers || !options_.doc_order_onebit)
-                        throw std::runtime_error("Tensor-padded launch contract differs");
+                        throw std::runtime_error("Tensor launch contract differs");
                     if (direct_docs) {
                         if (!ws_->d_mapped_refined_doc_ids ||
                             (collect_direct_lengths && (!ws_->d_refined_doc_lengths || !ws_->h_refined_doc_lengths)))
                             throw std::runtime_error("Missing Tensor direct mapped metadata buffers");
-                        tensor_token_document_detail::tensor_token_document<true><<<chunk_count,128,0,stream>>>(
-                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
-                            nullptr, nullptr, refined_ids, d_doc_ptrs_,
-                            ws_->d_mapped_refined_doc_ids,
-                            collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
-                            ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        if (options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPaddedMax4) {
+                            tensor_token_document_max4_detail::tensor_token_document_max4<true><<<chunk_count,128,0,stream>>>(
+                                ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                nullptr, nullptr, refined_ids, d_doc_ptrs_,
+                                ws_->d_mapped_refined_doc_ids,
+                                collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
+                                ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        } else {
+                            tensor_token_document_detail::tensor_token_document<true><<<chunk_count,128,0,stream>>>(
+                                ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                nullptr, nullptr, refined_ids, d_doc_ptrs_,
+                                ws_->d_mapped_refined_doc_ids,
+                                collect_direct_lengths ? ws_->d_refined_doc_lengths : nullptr,
+                                ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        }
                     } else {
-                        tensor_token_document_detail::tensor_token_document<false><<<chunk_count,128,0,stream>>>(
-                            ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
-                            ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
-                            nullptr, nullptr, nullptr, nullptr,
-                            ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        if (options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPaddedMax4) {
+                            tensor_token_document_max4_detail::tensor_token_document_max4<false><<<chunk_count,128,0,stream>>>(
+                                ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                nullptr, nullptr, nullptr, nullptr,
+                                ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        } else {
+                            tensor_token_document_detail::tensor_token_document<false><<<chunk_count,128,0,stream>>>(
+                                ws_->d_lut, codes, factors, ws_->d_cb1_sumq,
+                                ws_->d_refined_token_positions, ws_->d_refined_doc_offsets,
+                                nullptr, nullptr, nullptr, nullptr,
+                                ws_->d_one_bit_token_scores, static_cast<size_t>(chunk_count));
+                        }
                     }
                 } else if (direct_docs) {
                     if (!ws_->uma_query_buffers || !ws_->d_mapped_refined_doc_ids ||

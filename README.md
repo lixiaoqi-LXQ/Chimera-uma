@@ -166,3 +166,10 @@ comparison. The research repository tracks the snapshot in
 equally to the three named stages through `SearchOptions`; the original
 Chimera scoring kernels remain unchanged. Routing parameter gains are reported
 separately from CPU cooperation, with recall checked on the complete query set.
+
+
+`tensor-padded-max4` is an opt-in native C++ custom-stage candidate. It shares the
+TensorPadded FP16-input/FP32-accum and half-scalar QA contracts, with four lanes per
+query for max reduction. See [source/validation scope](tensor-padded-max4.md).
+The default layout remains `grouped`; this candidate has no accepted performance
+result. The legacy Python adapter does not expose the experimental layout options.

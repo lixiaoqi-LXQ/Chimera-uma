@@ -69,7 +69,7 @@ inline bool uses_flat_centroid_route(AlgorithmVariant v) { return v == Algorithm
 enum class CagraMemoryPlacement { Device, AtsDataset, AtsDatasetAndGraph };
 // Existing cuVS search implementations; this only controls host dispatch.
 enum class CagraSearchAlgorithm { Auto = 100, SingleCta = 0, MultiCta = 1, MultiKernel = 2 };
-enum class FusedTokenDocumentLayout { Grouped, Interleaved, Cached, Warp4Doc, TensorPadded };
+enum class FusedTokenDocumentLayout { Grouped, Interleaved, Cached, Warp4Doc, TensorPadded, TensorPaddedMax4 };
 inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout layout) {
     switch (layout) {
         case FusedTokenDocumentLayout::Grouped: return "grouped";
@@ -77,6 +77,7 @@ inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout lay
         case FusedTokenDocumentLayout::Cached: return "cached";
         case FusedTokenDocumentLayout::Warp4Doc: return "warp4doc";
         case FusedTokenDocumentLayout::TensorPadded: return "tensor-padded";
+        case FusedTokenDocumentLayout::TensorPaddedMax4: return "tensor-padded-max4";
         default: throw std::invalid_argument("Unknown fused token/document layout");
     }
 }
@@ -84,6 +85,12 @@ inline const char* fused_token_document_layout_name(FusedTokenDocumentLayout lay
 // Compiled library capability; these queries do not initialize CUDA.
 bool partial_topk_available() noexcept;
 int partial_topk_cub_version() noexcept;
+
+// Tensor layouts share the finite FP16-input domain and half-scalar QA contract.
+inline bool is_tensor_token_document_layout(FusedTokenDocumentLayout layout) noexcept {
+    return layout == FusedTokenDocumentLayout::TensorPadded ||
+           layout == FusedTokenDocumentLayout::TensorPaddedMax4;
+}
 
 struct SearchOptions {
     AlgorithmVariant algorithm_variant = AlgorithmVariant::Full;
@@ -104,9 +111,9 @@ struct SearchOptions {
     bool verify_full_bit = false;  // Diagnostic: replay identical candidates on CPU.
     bool partial_topk = false;  // Custom-only stable-equivalent GPU partial-score selection, k_refine<=1000.
     bool doc_order_onebit = false;  // Optional document-order replica, built and verified once at load.
-    bool fused_token_document = false;  // Opt-in fusion; TensorPadded explicitly uses FP16 inputs, other layouts preserve FP32.
-    bool fused_direct_docs = false;  // Grouped/warp4doc/TensorPadded read natural doc ranges; bypass refined metadata handoff.
-    int fused_token_document_threads = 128;  // 128/256; warp4doc and TensorPadded require128.
+    bool fused_token_document = false;  // Opt-in fusion; Tensor layouts use FP16 inputs, other layouts preserve FP32.
+    bool fused_direct_docs = false;  // Grouped/warp4doc/Tensor layouts read natural doc ranges; bypass refined metadata handoff.
+    int fused_token_document_threads = 128;  // 128/256; warp4doc and Tensor layouts require128.
     FusedTokenDocumentLayout fused_token_document_layout = FusedTokenDocumentLayout::Grouped;
     bool split_token_score = false;  // Opt-in independent Q8 CTA groups, original score matrix.
     bool compact_token_score = false;  // Independent opt-in bounded-register token scorer.

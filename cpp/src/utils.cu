@@ -575,7 +575,7 @@ void chimera_index::allocate_workspace() {
                                   ws_->max_refined_candidates * sizeof(float)));
     }
 
-    if (options_.fused_token_document_layout == FusedTokenDocumentLayout::TensorPadded &&
+    if (is_tensor_token_document_layout(options_.fused_token_document_layout) &&
         options_.verify_full_bit) {
         const size_t values = ws_->max_refined_candidates * static_cast<size_t>(Q_DOCLEN);
         check_cuda(cudaMalloc(&ws_->d_tensor_querymax_capture, values * sizeof(float)));
